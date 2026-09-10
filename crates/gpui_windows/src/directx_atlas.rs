@@ -18,9 +18,26 @@ pub(crate) struct DirectXAtlas(Mutex<AtlasState<DirectXAtlasTextures>>);
 struct DirectXAtlasTextures {
     device: ID3D11Device,
     device_context: ID3D11DeviceContext,
+    resource_generation: ResourceGeneration,
     monochrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     polychrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     subpixel_textures: AtlasTextureList<DirectXAtlasTexture>,
+}
+
+#[derive(Default)]
+struct ResourceGeneration(u64);
+
+impl ResourceGeneration {
+    fn current(&self) -> u64 {
+        self.0
+    }
+
+    fn advance(&mut self) {
+        self.0 = self
+            .0
+            .checked_add(1)
+            .expect("DirectX atlas resource generation exhausted");
+    }
 }
 
 struct DirectXAtlasTexture {
@@ -69,6 +86,7 @@ impl DirectXAtlas {
             textures.monochrome_textures = AtlasTextureList::default();
             textures.polychrome_textures = AtlasTextureList::default();
             textures.subpixel_textures = AtlasTextureList::default();
+            textures.resource_generation.advance();
         });
     }
 }
@@ -84,6 +102,54 @@ impl PlatformAtlas for DirectXAtlas {
         self.0.lock().get_or_insert_with(key, build)
     }
 
+    fn update(
+        &self,
+        key: &AtlasKey,
+        bounds: Bounds<DevicePixels>,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let lock = self.0.lock();
+        let Some(tile) = lock.tile(key) else {
+            return Ok(());
+        };
+        let texture = lock
+            .backend
+            .texture(tile.texture_id)
+            .context("updated tile refers to a missing texture")?;
+        validate_upload(tile, bounds, bytes, texture.bytes_per_pixel)?;
+        let upload_bounds = Bounds {
+            origin: Point {
+                x: DevicePixels(
+                    tile.bounds
+                        .origin
+                        .x
+                        .0
+                        .checked_add(bounds.origin.x.0)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("texture update horizontal origin overflow")
+                        })?,
+                ),
+                y: DevicePixels(
+                    tile.bounds
+                        .origin
+                        .y
+                        .0
+                        .checked_add(bounds.origin.y.0)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("texture update vertical origin overflow")
+                        })?,
+                ),
+            },
+            size: bounds.size,
+        };
+        texture.upload(&lock.device_context, upload_bounds, bytes);
+        Ok(())
+    }
+
+    fn resource_generation(&self) -> u64 {
+        self.0.lock().backend.resource_generation.current()
+    }
+
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
     }
@@ -96,9 +162,14 @@ impl AtlasBackend for DirectXAtlasTextures {
         size: Size<DevicePixels>,
         bytes: &[u8],
     ) -> anyhow::Result<AtlasTile> {
-        let tile = self
-            .allocate(size, kind)
-            .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
+        let tile = match kind {
+            AtlasTextureKind::DynamicTexture => self
+                .allocate_dedicated(size, kind)
+                .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?,
+            _ => self
+                .allocate(size, kind)
+                .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?,
+        };
         let texture = self
             .texture(tile.texture_id)
             .ok_or_else(|| anyhow::anyhow!("allocated tile refers to a missing texture"))?;
@@ -111,7 +182,9 @@ impl AtlasBackend for DirectXAtlasTextures {
 
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
+                &mut self.polychrome_textures
+            }
             AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
         };
 
@@ -132,6 +205,28 @@ impl AtlasBackend for DirectXAtlasTextures {
 }
 
 impl DirectXAtlasTextures {
+
+    fn allocate_dedicated(
+        &mut self,
+        size: Size<DevicePixels>,
+        texture_kind: AtlasTextureKind,
+    ) -> Option<AtlasTile> {
+        const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
+            width: DevicePixels(16384),
+            height: DevicePixels(16384),
+        };
+        if size.width.0 <= 0
+            || size.height.0 <= 0
+            || size.width > MAX_ATLAS_SIZE.width
+            || size.height > MAX_ATLAS_SIZE.height
+        {
+            return None;
+        }
+
+        let texture = self.push_texture_with_size(size, texture_kind)?;
+        texture.allocate(size)
+    }
+
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -140,7 +235,9 @@ impl DirectXAtlasTextures {
         {
             let textures = match texture_kind {
                 AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-                AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+                AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
+                    &mut self.polychrome_textures
+                }
                 AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
             };
 
@@ -173,6 +270,14 @@ impl DirectXAtlasTextures {
             height: DevicePixels(16384),
         };
         let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
+        self.push_texture_with_size(size, kind)
+    }
+
+    fn push_texture_with_size(
+        &mut self,
+        size: Size<DevicePixels>,
+        kind: AtlasTextureKind,
+    ) -> Option<&mut DirectXAtlasTexture> {
         let pixel_format;
         let bind_flag;
         let bytes_per_pixel;
@@ -182,7 +287,7 @@ impl DirectXAtlasTextures {
                 bind_flag = D3D11_BIND_SHADER_RESOURCE;
                 bytes_per_pixel = 1;
             }
-            AtlasTextureKind::Polychrome => {
+            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
                 pixel_format = DXGI_FORMAT_B8G8R8A8_UNORM;
                 bind_flag = D3D11_BIND_SHADER_RESOURCE;
                 bytes_per_pixel = 4;
@@ -220,7 +325,9 @@ impl DirectXAtlasTextures {
 
         let texture_list = match kind {
             AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
+                &mut self.polychrome_textures
+            }
             AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
         };
         let index = texture_list.free_list.pop();
@@ -254,11 +361,60 @@ impl DirectXAtlasTextures {
     fn texture(&self, id: AtlasTextureId) -> Option<&DirectXAtlasTexture> {
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &self.monochrome_textures,
-            AtlasTextureKind::Polychrome => &self.polychrome_textures,
+            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
+                &self.polychrome_textures
+            }
             AtlasTextureKind::Subpixel => &self.subpixel_textures,
         };
         textures.textures.get(id.index as usize)?.as_ref()
     }
+}
+
+fn validate_upload(
+    tile: AtlasTile,
+    bounds: Bounds<DevicePixels>,
+    bytes: &[u8],
+    bytes_per_pixel: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bounds.origin.x.0 >= 0 && bounds.origin.y.0 >= 0,
+        "texture update origin must be non-negative"
+    );
+    anyhow::ensure!(
+        bounds.size.width.0 > 0 && bounds.size.height.0 > 0,
+        "texture update size must be positive"
+    );
+    let right = bounds
+        .origin
+        .x
+        .0
+        .checked_add(bounds.size.width.0)
+        .ok_or_else(|| anyhow::anyhow!("texture update horizontal bounds overflow"))?;
+    let bottom = bounds
+        .origin
+        .y
+        .0
+        .checked_add(bounds.size.height.0)
+        .ok_or_else(|| anyhow::anyhow!("texture update vertical bounds overflow"))?;
+    anyhow::ensure!(
+        right <= tile.bounds.size.width.0 && bottom <= tile.bounds.size.height.0,
+        "texture update exceeds the allocated tile bounds"
+    );
+    let expected_len = usize::try_from(bounds.size.width.0)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(bounds.size.height.0)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel as usize))
+        .ok_or_else(|| anyhow::anyhow!("texture update byte size overflow"))?;
+    anyhow::ensure!(
+        bytes.len() == expected_len,
+        "texture update contains {} bytes, expected {expected_len}",
+        bytes.len()
+    );
+    Ok(())
 }
 
 impl DirectXAtlasTexture {
@@ -417,5 +573,87 @@ mod tests {
 
         let tile_b = insert_tile(&atlas, big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+    }
+
+    fn make_dynamic_texture_key(texture_id: usize) -> AtlasKey {
+        AtlasKey::DynamicTexture(gpui::DynamicTextureParams {
+            texture_id: gpui::DynamicTextureId(texture_id),
+        })
+    }
+
+    #[test]
+    fn resource_generation_advances_once_per_invalidation() {
+        let mut generation = ResourceGeneration::default();
+
+        assert_eq!(generation.current(), 0);
+        generation.advance();
+        assert_eq!(generation.current(), 1);
+        generation.advance();
+        assert_eq!(generation.current(), 2);
+    }
+
+    #[test]
+    fn validate_upload_rejects_invalid_regions_and_payloads() {
+        let tile = AtlasTile {
+            texture_id: AtlasTextureId {
+                index: 0,
+                kind: AtlasTextureKind::Polychrome,
+            },
+            tile_id: gpui::TileId(0),
+            bounds: Bounds {
+                origin: Point::new(DevicePixels(0), DevicePixels(0)),
+                size: Size {
+                    width: DevicePixels(2),
+                    height: DevicePixels(2),
+                },
+            },
+            padding: 0,
+        };
+        let unit = |x: i32, y: i32| Bounds {
+            origin: Point::new(DevicePixels(x), DevicePixels(y)),
+            size: Size {
+                width: DevicePixels(1),
+                height: DevicePixels(1),
+            },
+        };
+
+        assert!(validate_upload(tile, unit(-1, 0), &[0; 4], 4).is_err());
+        assert!(validate_upload(tile, unit(2, 0), &[0; 4], 4).is_err());
+        assert!(validate_upload(tile, unit(0, 2), &[0; 4], 4).is_err());
+        assert!(validate_upload(tile, unit(0, 0), &[0; 3], 4).is_err());
+        assert!(validate_upload(tile, unit(0, 0), &[0; 4], 4).is_ok());
+    }
+
+    #[test]
+    fn dynamic_textures_use_exact_sized_dedicated_textures() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let size = Size {
+            width: DevicePixels(37),
+            height: DevicePixels(19),
+        };
+        let key = make_dynamic_texture_key(1);
+
+        let tile = insert_tile(&atlas, &key, size);
+        assert_eq!(
+            tile.bounds,
+            Bounds {
+                origin: Point::new(DevicePixels(0), DevicePixels(0)),
+                size,
+            }
+        );
+
+        let lock = atlas.0.lock();
+        let texture = lock.texture(tile.texture_id);
+        let mut description: D3D11_TEXTURE2D_DESC = unsafe { std::mem::zeroed() };
+        unsafe { texture.texture.GetDesc(&mut description) };
+        assert_eq!(description.Width, 37);
+        assert_eq!(description.Height, 19);
+        assert_eq!(lock.resource_generation.current(), 0);
+
+        // A second dynamic texture must not share the first one's backing texture.
+        let other = insert_tile(&atlas, &make_dynamic_texture_key(2), size);
+        assert_ne!(other.texture_id, tile.texture_id);
     }
 }
