@@ -115,7 +115,7 @@ impl PlatformAtlas for DirectXAtlas {
         let texture = lock
             .backend
             .texture(tile.texture_id)
-            .context("updated tile refers to a missing texture")?;
+            .ok_or_else(|| anyhow::anyhow!("updated tile refers to a missing texture"))?;
         validate_upload(tile, bounds, bytes, texture.bytes_per_pixel)?;
         let upload_bounds = Bounds {
             origin: Point {
@@ -142,12 +142,21 @@ impl PlatformAtlas for DirectXAtlas {
             },
             size: bounds.size,
         };
-        texture.upload(&lock.device_context, upload_bounds, bytes);
+        texture.upload(&lock.backend.device_context, upload_bounds, bytes);
         Ok(())
     }
 
     fn resource_generation(&self) -> u64 {
         self.0.lock().backend.resource_generation.current()
+    }
+
+    fn max_texture_size(&self) -> Option<Size<DevicePixels>> {
+        // D3D11 feature level 11 guarantees 16384x16384 2D textures.
+        const MAX: i32 = 16384;
+        Some(Size {
+            width: DevicePixels(MAX),
+            height: DevicePixels(MAX),
+        })
     }
 
     fn remove(&self, key: &AtlasKey) {
