@@ -103,6 +103,8 @@ impl DirectXAtlas {
         lock.clear(|textures| {
             textures.device = device.clone();
             textures.device_context = device_context.clone();
+            textures.max_texture_size =
+                max_texture_dimension_for_feature_level(unsafe { device.GetFeatureLevel() });
             textures.monochrome_textures = AtlasTextureList::default();
             textures.polychrome_textures = AtlasTextureList::default();
             textures.subpixel_textures = AtlasTextureList::default();
