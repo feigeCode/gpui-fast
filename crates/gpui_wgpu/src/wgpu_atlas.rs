@@ -43,6 +43,7 @@ struct WgpuAtlasTextures {
     pending_upload_bytes: usize,
     max_pending_upload_bytes: usize,
     next_texture_generation: u64,
+    flush_submissions: u64,
     resource_generation: u64,
 }
 
@@ -69,6 +70,7 @@ impl WgpuAtlas {
             pending_upload_bytes: 0,
             max_pending_upload_bytes: MAX_PENDING_UPLOAD_BYTES,
             next_texture_generation: 0,
+            flush_submissions: 0,
             resource_generation: 0,
         })))
     }
@@ -89,6 +91,11 @@ impl WgpuAtlas {
     #[cfg(test)]
     pub fn set_max_pending_upload_bytes(&self, bytes: usize) {
         self.0.lock().backend.max_pending_upload_bytes = bytes;
+    }
+
+    #[cfg(test)]
+    pub fn flush_submission_count(&self) -> u64 {
+        self.0.lock().backend.flush_submissions
     }
 
     /// Returns the view backing `id`, or `None` once every tile in it has been
@@ -391,9 +398,13 @@ impl WgpuAtlasTextures {
         }
 
         if self.pending_upload_bytes.saturating_add(data.len()) > self.max_pending_upload_bytes {
-            // No frame is draining the queue (e.g. a hidden window): flush what is
-            // queued so CPU memory stays bounded while updates keep arriving.
+            // No frame is draining the queue (e.g. a hidden window). `write_texture`
+            // only stages the data inside wgpu; submit an (otherwise empty) command
+            // buffer so those staged writes are actually committed and reclaimed
+            // instead of accumulating in wgpu's pending-write queue.
             self.flush_uploads();
+            self.queue.submit(std::iter::empty());
+            self.flush_submissions += 1;
         }
 
         self.pending_upload_bytes = self.pending_upload_bytes.saturating_add(data.len());
@@ -949,6 +960,9 @@ mod tests {
             atlas.update(&key, texture_bounds(0, 0, 1, 1), &[1, 2, 3, 4])?;
         }
 
+        // Crossing the cap must hand the staged writes to wgpu with an explicit
+        // submit, not merely drop them from the atlas bookkeeping.
+        assert!(atlas.flush_submission_count() >= 1);
         let lock = atlas.0.lock();
         assert!(lock.pending_upload_bytes <= max_pending_bytes);
         assert!(lock.pending_uploads.len() <= 2);
