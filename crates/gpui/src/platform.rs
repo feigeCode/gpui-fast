@@ -1681,7 +1681,7 @@ impl AtlasKey {
                 }
             }
             AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
-            AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
+            AtlasKey::Image(_) => AtlasTextureKind::Image,
             AtlasKey::DynamicTexture(_) => AtlasTextureKind::DynamicTexture,
         }
     }
@@ -1982,6 +1982,13 @@ pub enum AtlasTextureKind {
     Subpixel = 2,
     /// Updatable textures that get a dedicated, exactly-sized GPU texture.
     DynamicTexture = 3,
+    /// Fork: images get their own texture pages, separate from glyph and
+    /// dynamic-texture polychrome pages, so dropping many images frees whole
+    /// pages instead of fragmenting shared ones.
+    Image = 4,
+    /// Fork: images whose tile fits within 256px go to small pages, keeping
+    /// icons from fragmenting the large-image pages.
+    ImageSmall = 5,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

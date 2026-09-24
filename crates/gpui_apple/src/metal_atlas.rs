@@ -35,6 +35,8 @@ impl MetalAtlas {
             supports_shared_storage: cfg!(target_os = "ios") || is_apple_gpu,
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
+            image_textures: Default::default(),
+            image_small_textures: Default::default(),
             pending_uploads: Vec::new(),
             pending_upload_bytes: 0,
         })))
@@ -103,6 +105,8 @@ struct MetalAtlasTextures {
     supports_shared_storage: bool,
     monochrome_textures: AtlasTextureList<MetalAtlasTexture>,
     polychrome_textures: AtlasTextureList<MetalAtlasTexture>,
+    image_textures: AtlasTextureList<MetalAtlasTexture>,
+    image_small_textures: AtlasTextureList<MetalAtlasTexture>,
     pending_uploads: Vec<PendingUpload>,
     pending_upload_bytes: usize,
 }
@@ -191,9 +195,10 @@ impl AtlasBackend for MetalAtlasTextures {
 
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
-                &mut self.polychrome_textures
-            }
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::DynamicTexture => &mut self.polychrome_textures,
+            AtlasTextureKind::Image => &mut self.image_textures,
+            AtlasTextureKind::ImageSmall => &mut self.image_small_textures,
             AtlasTextureKind::Subpixel => unreachable!(),
         };
 
@@ -239,6 +244,181 @@ impl AtlasBackend for MetalAtlasTextures {
 }
 
 impl MetalAtlasTextures {
+    /// Inserts a dynamic texture as a dedicated texture sized exactly to it.
+    fn insert_dedicated(
+        &mut self,
+        kind: AtlasTextureKind,
+        size: Size<DevicePixels>,
+    ) -> Result<AtlasTile> {
+        self.allocate_dedicated(size, kind)
+            .context("failed to allocate dedicated dynamic-texture")
+    }
+
+    fn allocate_dedicated(
+        &mut self,
+        size: Size<DevicePixels>,
+        texture_kind: AtlasTextureKind,
+    ) -> Option<AtlasTile> {
+        if size.width.0 <= 0
+            || size.height.0 <= 0
+            || size.width > MAX_ATLAS_SIZE.width
+            || size.height > MAX_ATLAS_SIZE.height
+        {
+            return None;
+        }
+
+        self.push_texture_with_size(size, texture_kind)
+            .allocate(size)
+    }
+
+    fn allocate(
+        &mut self,
+        size: Size<DevicePixels>,
+        texture_kind: AtlasTextureKind,
+    ) -> Option<AtlasTile> {
+        // Small images go to their own texture pages so a large render does not
+        // evict a whole shared page of icons.
+        const SMALL_IMAGE_TILE_MAX: i32 = 256;
+        let texture_kind = if texture_kind == AtlasTextureKind::Image
+            && size.width.0 <= SMALL_IMAGE_TILE_MAX
+            && size.height.0 <= SMALL_IMAGE_TILE_MAX
+        {
+            AtlasTextureKind::ImageSmall
+        } else {
+            texture_kind
+        };
+        {
+            let textures = match texture_kind {
+                AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+                AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
+                    &mut self.polychrome_textures
+                }
+                AtlasTextureKind::Image => &mut self.image_textures,
+                AtlasTextureKind::ImageSmall => &mut self.image_small_textures,
+                AtlasTextureKind::Subpixel => unreachable!(),
+            };
+
+            if let Some(tile) = textures
+                .iter_mut()
+                .rev()
+                .find_map(|texture| texture.allocate(size))
+            {
+                return Some(tile);
+            }
+        }
+
+        let texture = self.push_texture(size, texture_kind);
+        texture.allocate(size)
+    }
+
+    fn push_texture(
+        &mut self,
+        min_size: Size<DevicePixels>,
+        kind: AtlasTextureKind,
+    ) -> &mut MetalAtlasTexture {
+        // Color textures start smaller: image tiles are sparse and a 1024px
+        // first page wastes memory for icon-heavy but text-light surfaces.
+        const DEFAULT_COLOR_ATLAS_SIZE: Size<DevicePixels> = Size {
+            width: DevicePixels(512),
+            height: DevicePixels(512),
+        };
+        let default_size = match kind {
+            AtlasTextureKind::Polychrome
+            | AtlasTextureKind::DynamicTexture
+            | AtlasTextureKind::Image
+            | AtlasTextureKind::ImageSmall => DEFAULT_COLOR_ATLAS_SIZE,
+            AtlasTextureKind::Monochrome => DEFAULT_ATLAS_SIZE,
+            AtlasTextureKind::Subpixel => unreachable!(),
+        };
+        let size = min_size.min(&MAX_ATLAS_SIZE).max(&default_size);
+        self.push_texture_with_size(size, kind)
+    }
+
+    fn push_texture_with_size(
+        &mut self,
+        size: Size<DevicePixels>,
+        kind: AtlasTextureKind,
+    ) -> &mut MetalAtlasTexture {
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(size.width.into());
+        texture_descriptor.set_height(size.height.into());
+        let pixel_format;
+        let usage;
+        match kind {
+            AtlasTextureKind::Monochrome => {
+                pixel_format = metal::MTLPixelFormat::A8Unorm;
+                usage = metal::MTLTextureUsage::ShaderRead;
+            }
+            AtlasTextureKind::Polychrome
+            | AtlasTextureKind::DynamicTexture
+            | AtlasTextureKind::Image
+            | AtlasTextureKind::ImageSmall => {
+                pixel_format = metal::MTLPixelFormat::BGRA8Unorm;
+                usage = metal::MTLTextureUsage::ShaderRead;
+            }
+            AtlasTextureKind::Subpixel => unreachable!(),
+        }
+        texture_descriptor.set_pixel_format(pixel_format);
+        texture_descriptor.set_usage(usage);
+        // Shared memory mode can be used only on Apple GPU families
+        // https://developer.apple.com/documentation/metal/mtlresourceoptions/storagemodeshared
+        texture_descriptor.set_storage_mode(if self.is_apple_gpu {
+            metal::MTLStorageMode::Shared
+        } else {
+            metal::MTLStorageMode::Managed
+        });
+        let metal_texture = self.device.new_texture(&texture_descriptor);
+
+        let texture_list = match kind {
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
+                &mut self.polychrome_textures
+            }
+            AtlasTextureKind::Image => &mut self.image_textures,
+            AtlasTextureKind::ImageSmall => &mut self.image_small_textures,
+            AtlasTextureKind::Subpixel => unreachable!(),
+        };
+
+        let index = texture_list.free_list.pop();
+
+        let atlas_texture = MetalAtlasTexture {
+            id: AtlasTextureId {
+                index: index.unwrap_or(texture_list.textures.len()) as u32,
+                kind,
+            },
+            allocator: etagere::BucketedAtlasAllocator::new(size_to_etagere(size)),
+            metal_texture: AssertSend(metal_texture),
+            live_atlas_keys: 0,
+        };
+
+        if let Some(ix) = index {
+            texture_list.textures[ix] = Some(atlas_texture);
+            texture_list.textures.get_mut(ix)
+        } else {
+            texture_list.textures.push(Some(atlas_texture));
+            texture_list.textures.last_mut()
+        }
+        .unwrap()
+        .as_mut()
+        .unwrap()
+    }
+
+    fn texture(&self, id: AtlasTextureId) -> Option<&MetalAtlasTexture> {
+        let textures = match id.kind {
+            AtlasTextureKind::Monochrome => &self.monochrome_textures,
+            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => &self.polychrome_textures,
+            AtlasTextureKind::Image => &self.image_textures,
+            AtlasTextureKind::ImageSmall => &self.image_small_textures,
+            AtlasTextureKind::Subpixel => unreachable!(),
+        };
+        textures.textures.get(id.index as usize)?.as_ref()
+    }
+
+    fn texture_if_present(&self, id: AtlasTextureId) -> Option<&MetalAtlasTexture> {
+        self.texture(id)
+    }
+
+    /// Queues a dynamic-texture upload to be applied on the next frame's command buffer.
     fn queue_upload(
         &mut self,
         tile: AtlasTile,
@@ -316,148 +496,6 @@ impl MetalAtlasTextures {
         }
         blit.end_encoding();
     }
-    fn allocate_dedicated(
-        &mut self,
-        size: Size<DevicePixels>,
-        texture_kind: AtlasTextureKind,
-    ) -> Option<AtlasTile> {
-        if size.width.0 <= 0
-            || size.height.0 <= 0
-            || size.width > MAX_ATLAS_SIZE.width
-            || size.height > MAX_ATLAS_SIZE.height
-        {
-            return None;
-        }
-
-        self.push_texture_with_size(size, texture_kind)
-            .allocate(size)
-    }
-
-    fn allocate(
-        &mut self,
-        size: Size<DevicePixels>,
-        texture_kind: AtlasTextureKind,
-    ) -> Option<AtlasTile> {
-        {
-            let textures = match texture_kind {
-                AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-                AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
-                    &mut self.polychrome_textures
-                }
-                AtlasTextureKind::Subpixel => unreachable!(),
-            };
-
-            if let Some(tile) = textures
-                .iter_mut()
-                .rev()
-                .find_map(|texture| texture.allocate(size))
-            {
-                return Some(tile);
-            }
-        }
-
-        let texture = self.push_texture(size, texture_kind);
-        texture.allocate(size)
-    }
-
-    fn push_texture(
-        &mut self,
-        min_size: Size<DevicePixels>,
-        kind: AtlasTextureKind,
-    ) -> &mut MetalAtlasTexture {
-        let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
-        self.push_texture_with_size(size, kind)
-    }
-
-    fn push_texture_with_size(
-        &mut self,
-        size: Size<DevicePixels>,
-        kind: AtlasTextureKind,
-    ) -> &mut MetalAtlasTexture {
-        let texture_descriptor = metal::TextureDescriptor::new();
-        texture_descriptor.set_width(size.width.into());
-        texture_descriptor.set_height(size.height.into());
-        let pixel_format;
-        let usage;
-        match kind {
-            AtlasTextureKind::Monochrome => {
-                pixel_format = metal::MTLPixelFormat::A8Unorm;
-                usage = metal::MTLTextureUsage::ShaderRead;
-            }
-            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
-                pixel_format = metal::MTLPixelFormat::BGRA8Unorm;
-                usage = metal::MTLTextureUsage::ShaderRead;
-            }
-            AtlasTextureKind::Subpixel => unreachable!(),
-        }
-        texture_descriptor.set_pixel_format(pixel_format);
-        texture_descriptor.set_usage(usage);
-        // Shared memory mode can be used only on Apple GPU families
-        // https://developer.apple.com/documentation/metal/mtlresourceoptions/storagemodeshared
-        texture_descriptor.set_storage_mode(if self.supports_shared_storage {
-            metal::MTLStorageMode::Shared
-        } else {
-            metal::MTLStorageMode::Managed
-        });
-        let metal_texture = self.device.new_texture(&texture_descriptor);
-
-        let texture_list = match kind {
-            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
-                &mut self.polychrome_textures
-            }
-            AtlasTextureKind::Subpixel => unreachable!(),
-        };
-
-        let index = texture_list.free_list.pop();
-
-        let atlas_texture = MetalAtlasTexture {
-            id: AtlasTextureId {
-                index: index.unwrap_or(texture_list.textures.len()) as u32,
-                kind,
-            },
-            allocator: etagere::BucketedAtlasAllocator::new(size_to_etagere(size)),
-            metal_texture: AssertSend(metal_texture),
-            live_atlas_keys: 0,
-        };
-
-        if let Some(ix) = index {
-            texture_list.textures[ix] = Some(atlas_texture);
-            texture_list.textures.get_mut(ix)
-        } else {
-            texture_list.textures.push(Some(atlas_texture));
-            texture_list.textures.last_mut()
-        }
-        .unwrap()
-        .as_mut()
-        .unwrap()
-    }
-
-    fn texture(&self, id: AtlasTextureId) -> Option<&MetalAtlasTexture> {
-        let textures = match id.kind {
-            AtlasTextureKind::Monochrome => &self.monochrome_textures,
-            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
-                &self.polychrome_textures
-            }
-            AtlasTextureKind::Subpixel => unreachable!(),
-        };
-        textures.textures.get(id.index as usize)?.as_ref()
-    }
-
-    fn texture_if_present(&self, id: AtlasTextureId) -> Option<&MetalAtlasTexture> {
-        let textures = match id.kind {
-            AtlasTextureKind::Monochrome => &self.monochrome_textures,
-            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
-                &self.polychrome_textures
-            }
-            AtlasTextureKind::Subpixel => unreachable!(),
-        };
-        textures
-            .textures
-            .get(id.index as usize)
-            .and_then(|t| t.as_ref())
-    }
-
 }
 
 fn validate_upload(
@@ -633,6 +671,7 @@ mod tests {
         let tile_b = insert_tile(&atlas, key_b.clone(), small);
         let tile_c = insert_tile(&atlas, key_c.clone(), small);
 
+        assert_eq!(tile_a.texture_id.kind, AtlasTextureKind::ImageSmall);
         assert_eq!(tile_a.texture_id, tile_b.texture_id);
         assert_eq!(tile_b.texture_id, tile_c.texture_id);
 
@@ -683,26 +722,20 @@ mod tests {
             return;
         };
 
-        let small = Size {
-            width: DevicePixels(64),
-            height: DevicePixels(64),
-        };
         let big = Size {
             width: DevicePixels(700),
             height: DevicePixels(700),
         };
 
-        let keeper_key = make_image_key(1, 0);
         let big_key_a = make_image_key(2, 0);
         let big_key_b = make_image_key(3, 0);
 
-        let keeper_tile = insert_tile(&atlas, keeper_key, small);
         let tile_a = insert_tile(&atlas, big_key_a.clone(), big);
-        assert_eq!(keeper_tile.texture_id, tile_a.texture_id);
+        assert_eq!(tile_a.texture_id.kind, AtlasTextureKind::Image);
 
         atlas.remove(&big_key_a);
         let tile_b = insert_tile(&atlas, big_key_b, big);
-        assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+        assert_eq!(tile_b.texture_id, tile_a.texture_id);
     }
 
     #[test]

@@ -273,6 +273,17 @@ impl WgpuAtlasTextures {
         size: Size<DevicePixels>,
         texture_kind: AtlasTextureKind,
     ) -> Option<AtlasTile> {
+        // Small images go to their own texture pages so a large render does not
+        // evict a whole shared page of icons.
+        const SMALL_IMAGE_TILE_MAX: i32 = 256;
+        let texture_kind = if texture_kind == AtlasTextureKind::Image
+            && size.width.0 <= SMALL_IMAGE_TILE_MAX
+            && size.height.0 <= SMALL_IMAGE_TILE_MAX
+        {
+            AtlasTextureKind::ImageSmall
+        } else {
+            texture_kind
+        };
         {
             let textures = &mut self.storage[texture_kind];
 
@@ -298,13 +309,26 @@ impl WgpuAtlasTextures {
             width: DevicePixels(1024),
             height: DevicePixels(1024),
         };
+        // Color textures start smaller: image tiles are sparse and a 1024px
+        // first page wastes memory for icon-heavy but text-light surfaces.
+        const DEFAULT_COLOR_ATLAS_SIZE: Size<DevicePixels> = Size {
+            width: DevicePixels(512),
+            height: DevicePixels(512),
+        };
+        let default_size = match kind {
+            AtlasTextureKind::Polychrome
+            | AtlasTextureKind::DynamicTexture
+            | AtlasTextureKind::Image
+            | AtlasTextureKind::ImageSmall => DEFAULT_COLOR_ATLAS_SIZE,
+            AtlasTextureKind::Monochrome | AtlasTextureKind::Subpixel => DEFAULT_ATLAS_SIZE,
+        };
         let max_texture_size = self.max_texture_size as i32;
         let max_atlas_size = Size {
             width: DevicePixels(max_texture_size),
             height: DevicePixels(max_texture_size),
         };
 
-        let size = min_size.min(&max_atlas_size).max(&DEFAULT_ATLAS_SIZE);
+        let size = min_size.min(&max_atlas_size).max(&default_size);
         self.push_texture_with_size(size, kind)
     }
 
@@ -317,7 +341,9 @@ impl WgpuAtlasTextures {
             AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
             AtlasTextureKind::Subpixel
             | AtlasTextureKind::Polychrome
-            | AtlasTextureKind::DynamicTexture => self.color_texture_format,
+            | AtlasTextureKind::DynamicTexture
+            | AtlasTextureKind::Image
+            | AtlasTextureKind::ImageSmall => self.color_texture_format,
         };
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -504,6 +530,8 @@ struct WgpuAtlasStorage {
     monochrome_textures: AtlasTextureList<WgpuAtlasTexture>,
     subpixel_textures: AtlasTextureList<WgpuAtlasTexture>,
     polychrome_textures: AtlasTextureList<WgpuAtlasTexture>,
+    image_textures: AtlasTextureList<WgpuAtlasTexture>,
+    image_small_textures: AtlasTextureList<WgpuAtlasTexture>,
 }
 
 impl ops::Index<AtlasTextureKind> for WgpuAtlasStorage {
@@ -512,9 +540,10 @@ impl ops::Index<AtlasTextureKind> for WgpuAtlasStorage {
         match kind {
             AtlasTextureKind::Monochrome => &self.monochrome_textures,
             AtlasTextureKind::Subpixel => &self.subpixel_textures,
-            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
-                &self.polychrome_textures
-            }
+            AtlasTextureKind::Polychrome => &self.polychrome_textures,
+            AtlasTextureKind::DynamicTexture => &self.polychrome_textures,
+            AtlasTextureKind::Image => &self.image_textures,
+            AtlasTextureKind::ImageSmall => &self.image_small_textures,
         }
     }
 }
@@ -524,9 +553,10 @@ impl ops::IndexMut<AtlasTextureKind> for WgpuAtlasStorage {
         match kind {
             AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
             AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
-            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
-                &mut self.polychrome_textures
-            }
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::DynamicTexture => &mut self.polychrome_textures,
+            AtlasTextureKind::Image => &mut self.image_textures,
+            AtlasTextureKind::ImageSmall => &mut self.image_small_textures,
         }
     }
 }
@@ -690,10 +720,6 @@ mod tests {
         let (device, queue) = test_device_and_queue()?;
         let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
 
-        let small = Size {
-            width: DevicePixels(64),
-            height: DevicePixels(64),
-        };
         let big = Size {
             width: DevicePixels(700),
             height: DevicePixels(700),
@@ -715,17 +741,15 @@ mod tests {
                 .expect("callback returns Some")
         };
 
-        let keeper_key = make_key(1);
         let big_key_a = make_key(2);
         let big_key_b = make_key(3);
 
-        let keeper_tile = insert(keeper_key, small);
         let tile_a = insert(big_key_a.clone(), big);
-        assert_eq!(keeper_tile.texture_id, tile_a.texture_id);
+        assert_eq!(tile_a.texture_id.kind, AtlasTextureKind::Image);
 
         atlas.remove(&big_key_a);
         let tile_b = insert(big_key_b, big);
-        assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+        assert_eq!(tile_b.texture_id, tile_a.texture_id);
         Ok(())
     }
 
