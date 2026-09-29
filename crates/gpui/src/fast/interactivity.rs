@@ -54,6 +54,30 @@ impl DerefMut for Aria {
     }
 }
 
+/// A part of an element's interactivity that few elements set, such as a drag
+/// listener, a tooltip or a group's hover style, boxed to one pointer.
+///
+/// An [`Interactivity`] is built for every div of every frame, and moves with
+/// its element through every call of its builder. Held inline, these parts
+/// were 130-odd of its bytes, written and copied for every element though
+/// almost always empty. Boxed, the few elements that set one pay for an
+/// allocation instead.
+///
+/// [`Interactivity`]: crate::Interactivity
+pub(crate) type Rare<T> = Option<Box<T>>;
+
+/// A [`Rare`] part holding `value`.
+#[inline]
+pub(crate) fn rare<T>(value: T) -> Rare<T> {
+    Some(Box::new(value))
+}
+
+/// A [`Rare`] part holding `value`, if there is one.
+#[inline]
+pub(crate) fn rare_option<T>(value: Option<T>) -> Rare<T> {
+    value.map(Box::new)
+}
+
 /// A list one pointer wide that allocates nothing while it is empty.
 ///
 /// An [`Interactivity`] holds a score of listener lists, nearly all of them

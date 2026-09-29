@@ -51,10 +51,13 @@ impl TextStyleStack {
         self.resolved.get_mut().push(None);
     }
 
-    pub(crate) fn pop(&mut self) -> Option<TextStyleRefinement> {
-        let refinement = self.refinements.pop()?;
-        self.resolved.get_mut().pop();
-        Some(refinement)
+    /// Pops the refinement pushed last, dropping it where it lies rather
+    /// than handing it back: nothing wants it, and it is 200-odd bytes.
+    pub(crate) fn pop(&mut self) {
+        if let Some(depth) = self.refinements.len().checked_sub(1) {
+            self.refinements.truncate(depth);
+            self.resolved.get_mut().truncate(depth + 1);
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -70,14 +73,17 @@ impl TextStyleStack {
         if let Some(style) = &resolved[depth] {
             return style.clone();
         }
+        // `Rc::make_mut` clones the known style straight into the new
+        // style's allocation, where a clone refined and then wrapped would be
+        // copied twice more.
         let (mut style, from) = match resolved[..depth].iter().rposition(|style| style.is_some()) {
-            Some(known) => ((**resolved[known].as_ref().unwrap()).clone(), known),
-            None => (TextStyle::default(), 0),
+            Some(known) => (resolved[known].clone().unwrap(), known),
+            None => (Rc::new(TextStyle::default()), 0),
         };
+        let refined = Rc::make_mut(&mut style);
         for refinement in &self.refinements[from..] {
-            style.refine(refinement);
+            refined.refine(refinement);
         }
-        let style = Rc::new(style);
         resolved[depth] = Some(style.clone());
         style
     }

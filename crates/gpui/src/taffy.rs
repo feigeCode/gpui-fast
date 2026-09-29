@@ -72,7 +72,7 @@ impl TaffyLayoutEngine {
         crate::fast::layout::request_retained_layout(
             self,
             fast_key,
-            style,
+            &style,
             rem_size,
             scale_factor,
             children,
@@ -96,7 +96,7 @@ impl TaffyLayoutEngine {
         crate::fast::layout::request_retained_measured_layout(
             self,
             fast_key,
-            style,
+            &style,
             rem_size,
             scale_factor,
             measure,

@@ -421,7 +421,7 @@ impl Window {
         let mut layout_engine = self.layout_engine.take().unwrap();
         let id = layout_engine.request_retained_carried_measured_layout(
             key,
-            Style::default(),
+            &Style::default(),
             rem_size,
             scale_factor,
             memo,

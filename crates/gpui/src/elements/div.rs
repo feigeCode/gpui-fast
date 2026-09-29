@@ -582,7 +582,7 @@ impl Interactivity {
         &mut self,
         predicate: impl Fn(&dyn Any, &mut Window, &mut App) -> bool + 'static,
     ) {
-        self.can_drop_predicate = Some(Box::new(predicate));
+        self.can_drop_predicate = crate::fast::interactivity::rare(Box::new(predicate));
     }
 
     /// Bind the given callback to click events of this element.
@@ -631,7 +631,7 @@ impl Interactivity {
             self.drag_listener.is_none(),
             "calling on_drag more than once on the same element is not supported"
         );
-        self.drag_listener = Some(DragListener {
+        self.drag_listener = crate::fast::interactivity::rare(DragListener {
             value: Arc::new(value),
             render: Box::new(move |value, offset, window, cx| {
                 constructor(value.downcast_ref().unwrap(), offset, window, cx).into()
@@ -686,7 +686,7 @@ impl Interactivity {
             self.hover_listener.is_none(),
             "calling on_hover more than once on the same element is not supported"
         );
-        self.hover_listener = Some(Box::new(listener));
+        self.hover_listener = crate::fast::interactivity::rare(Box::new(listener));
     }
 
     /// Sets how [`Self::on_hover`] responds to key presses while the mouse is stationary.
@@ -709,7 +709,7 @@ impl Interactivity {
             self.tooltip_builder.is_none(),
             "calling tooltip more than once on the same element is not supported"
         );
-        self.tooltip_builder = Some(TooltipBuilder {
+        self.tooltip_builder = crate::fast::interactivity::rare(TooltipBuilder {
             build: Rc::new(build_tooltip),
             hoverable: false,
         });
@@ -728,7 +728,7 @@ impl Interactivity {
             self.tooltip_builder.is_none(),
             "calling tooltip more than once on the same element is not supported"
         );
-        self.tooltip_builder = Some(TooltipBuilder {
+        self.tooltip_builder = crate::fast::interactivity::rare(TooltipBuilder {
             build: Rc::new(build_tooltip),
             hoverable: true,
         });
@@ -860,7 +860,7 @@ pub trait InteractiveElement: Sized {
         group_name: impl Into<SharedString>,
         f: impl FnOnce(StyleRefinement) -> StyleRefinement,
     ) -> Self {
-        self.interactivity().group_hover_style = Some(GroupStyle {
+        self.interactivity().group_hover_style = crate::fast::interactivity::rare(GroupStyle {
             group: group_name.into(),
             style: Box::new(f(StyleRefinement::default())),
         });
@@ -1383,7 +1383,8 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         mut self,
         f: impl FnOnce(&mut crate::A11ySubtreeBuilder) + 'static,
     ) -> Self {
-        self.interactivity().a11y_synthetic_children = Some(Box::new(f));
+        self.interactivity().a11y_synthetic_children =
+            crate::fast::interactivity::rare(Box::new(f));
         self
     }
 
@@ -1549,7 +1550,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
     /// Track the scroll state of this element with the given handle.
     fn anchor_scroll(mut self, scroll_anchor: Option<ScrollAnchor>) -> Self {
-        self.interactivity().scroll_anchor = scroll_anchor;
+        self.interactivity().scroll_anchor = crate::fast::interactivity::rare_option(scroll_anchor);
         self
     }
 
@@ -1571,7 +1572,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     where
         Self: Sized,
     {
-        self.interactivity().group_active_style = Some(GroupStyle {
+        self.interactivity().group_active_style = crate::fast::interactivity::rare(GroupStyle {
             group: group_name.into(),
             style: Box::new(f(StyleRefinement::default())),
         });
@@ -1946,7 +1947,7 @@ impl Element for Div {
                             .iter_mut()
                             .map(|child| child.request_layout(window, cx))
                             .collect::<SmallVec<_>>();
-                        window.request_layout(style, child_layout_ids.iter().copied(), cx)
+                        crate::fast::layout::request_layout(window, &style, &child_layout_ids)
                     })
                 },
             )
@@ -2139,7 +2140,7 @@ pub struct Interactivity {
     pub(crate) focusable: bool,
     pub(crate) tracked_focus_handle: Option<FocusHandle>,
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
-    pub(crate) scroll_anchor: Option<ScrollAnchor>,
+    pub(crate) scroll_anchor: crate::fast::interactivity::Rare<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) group: Option<SharedString>,
@@ -2150,9 +2151,9 @@ pub struct Interactivity {
     pub(crate) in_focus_style: Option<Box<StyleRefinement>>,
     pub(crate) focus_visible_style: Option<Box<StyleRefinement>>,
     pub(crate) hover_style: Option<Box<StyleRefinement>>,
-    pub(crate) group_hover_style: Option<GroupStyle>,
+    pub(crate) group_hover_style: crate::fast::interactivity::Rare<GroupStyle>,
     pub(crate) active_style: Option<Box<StyleRefinement>>,
-    pub(crate) group_active_style: Option<GroupStyle>,
+    pub(crate) group_active_style: crate::fast::interactivity::Rare<GroupStyle>,
     pub(crate) drag_over_styles: crate::fast::interactivity::LazyVec<(
         TypeId,
         Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> StyleRefinement>,
@@ -2172,13 +2173,14 @@ pub struct Interactivity {
         crate::fast::interactivity::LazyVec<ModifiersChangedListener>,
     pub(crate) action_listeners: crate::fast::interactivity::LazyVec<(TypeId, ActionListener)>,
     pub(crate) drop_listeners: crate::fast::interactivity::LazyVec<(TypeId, DropListener)>,
-    pub(crate) can_drop_predicate: Option<CanDropPredicate>,
+    pub(crate) can_drop_predicate: crate::fast::interactivity::Rare<CanDropPredicate>,
     pub(crate) click_listeners: crate::fast::interactivity::LazyVec<ClickListener>,
     pub(crate) aux_click_listeners: crate::fast::interactivity::LazyVec<ClickListener>,
-    pub(crate) drag_listener: Option<DragListener>,
-    pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
+    pub(crate) drag_listener: crate::fast::interactivity::Rare<DragListener>,
+    pub(crate) hover_listener:
+        crate::fast::interactivity::Rare<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) hover_listener_mode: HoverListenerMode,
-    pub(crate) tooltip_builder: Option<TooltipBuilder>,
+    pub(crate) tooltip_builder: crate::fast::interactivity::Rare<TooltipBuilder>,
     pub(crate) tooltip_show_delay: Option<Duration>,
     pub(crate) window_control: Option<WindowControlArea>,
     pub(crate) hitbox_behavior: HitboxBehavior,
@@ -2190,7 +2192,8 @@ pub struct Interactivity {
         accesskit::Action,
         crate::window::a11y::A11yActionListener,
     )>,
-    pub(crate) a11y_synthetic_children: Option<Box<dyn FnOnce(&mut crate::A11ySubtreeBuilder)>>,
+    pub(crate) a11y_synthetic_children:
+        crate::fast::interactivity::Rare<Box<dyn FnOnce(&mut crate::A11ySubtreeBuilder)>>,
     pub(crate) report_active_descendant_focus: bool,
     pub(crate) override_role: Option<accesskit::Role>,
     pub(crate) aria: crate::fast::interactivity::Aria,

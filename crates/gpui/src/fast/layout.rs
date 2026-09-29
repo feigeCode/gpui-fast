@@ -525,7 +525,7 @@ impl TaffyLayoutEngine {
     pub(crate) fn request_retained_carried_measured_layout(
         &mut self,
         key: Option<u64>,
-        style: Style,
+        style: &Style,
         rem_size: Pixels,
         scale_factor: f32,
         memo: Rc<dyn Any>,
@@ -546,7 +546,7 @@ impl TaffyLayoutEngine {
             .filter(|node| {
                 node.claimed_in_frame != frame
                     && node.measured
-                    && node.style_fingerprint == layout_fingerprint(&style, rem_size, scale_factor)
+                    && node.style_fingerprint == layout_fingerprint(style, rem_size, scale_factor)
             })
             .map(|node| (node.measurement.clone(), node.measure_log.clone()));
         if let Some((previous, log)) = reusable {
@@ -691,6 +691,30 @@ pub(crate) fn release_unclaimed_nodes(engine: &mut TaffyLayoutEngine) {
     retention.frame += 1;
 }
 
+/// [`Window::request_layout`] for a style the caller keeps, and children it
+/// holds in a slice: neither is copied on the way to the layout engine, where
+/// the window's method takes a style of 600-odd bytes by value, and copies it
+/// at every call it passes through.
+#[inline]
+pub(crate) fn request_layout(
+    window: &mut Window,
+    style: &Style,
+    children: &[LayoutId],
+) -> LayoutId {
+    window.invalidator.debug_assert_prepaint();
+    let rem_size = window.rem_size();
+    let scale_factor = window.scale_factor();
+    let key = crate::fast::layout_key::layout_key(window);
+    request_retained_layout(
+        window.layout_engine.as_mut().unwrap(),
+        key,
+        style,
+        rem_size,
+        scale_factor,
+        children,
+    )
+}
+
 /// Adds a node to the layout tree, reusing the one retained under `key`
 /// when there is one. See [`TaffyLayoutEngine::request_layout`].
 ///
@@ -701,14 +725,14 @@ pub(crate) fn release_unclaimed_nodes(engine: &mut TaffyLayoutEngine) {
 pub(crate) fn request_retained_layout(
     engine: &mut TaffyLayoutEngine,
     key: Option<u64>,
-    style: Style,
+    style: &Style,
     rem_size: Pixels,
     scale_factor: f32,
     children: &[LayoutId],
 ) -> LayoutId {
     let key = match engine.claim(key) {
         Claim::Reused(key, id) => {
-            engine.apply_requested_style(key, id, &style, rem_size, scale_factor);
+            engine.apply_requested_style(key, id, style, rem_size, scale_factor);
             engine.apply_children(key, id, children);
             // A node that measured itself on an earlier frame no longer does.
             if engine
@@ -738,7 +762,7 @@ pub(crate) fn request_retained_layout(
 
     engine.retention.stats.nodes_created += 1;
     engine.retention.layout_changes += 1;
-    let style_fingerprint = layout_fingerprint(&style, rem_size, scale_factor);
+    let style_fingerprint = layout_fingerprint(style, rem_size, scale_factor);
     let taffy_style = style.to_taffy(rem_size, scale_factor);
     let id: LayoutId = engine
         .taffy
@@ -772,7 +796,7 @@ pub(crate) fn request_retained_layout(
 pub(crate) fn request_retained_measured_layout(
     engine: &mut TaffyLayoutEngine,
     key: Option<u64>,
-    style: Style,
+    style: &Style,
     rem_size: Pixels,
     scale_factor: f32,
     measure: impl FnMut(
@@ -795,7 +819,7 @@ pub(crate) fn request_retained_measured_layout(
                 Claim::Vacant(key) => Some(key),
                 _ => None,
             };
-            let style_fingerprint = layout_fingerprint(&style, rem_size, scale_factor);
+            let style_fingerprint = layout_fingerprint(style, rem_size, scale_factor);
             let taffy_style = style.to_taffy(rem_size, scale_factor);
             engine.retention.stats.nodes_created += 1;
             engine.retention.layout_changes += 1;
@@ -809,7 +833,7 @@ pub(crate) fn request_retained_measured_layout(
         }
     };
 
-    engine.apply_requested_style(key, id, &style, rem_size, scale_factor);
+    engine.apply_requested_style(key, id, style, rem_size, scale_factor);
     engine.apply_children(key, id, &[]);
 
     // Nothing says whether the measurement still stands, and what it
