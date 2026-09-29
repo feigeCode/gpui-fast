@@ -16,7 +16,7 @@
 //! subscribes to, which a timer streams quotes into; see `workspace.rs`.
 //!
 //! The toolbar picks what scrolls itself and how fast the workspace's quotes
-//! stream — 4, 15 or 60 Hz, of the rates of `gpui_perf::rate` — and switches the
+//! stream — 120, 360 or 960 a second, of the rates of `gpui_perf::rate` — and switches the
 //! data refresh and retained views. Every command has a key: `1`–`6` for what
 //! scrolls, `R` for the refresh, `Q` for the next quote rate, `V` for retained views,
 //! and the arrow keys to move through the sidebar. The status bar shows,
@@ -29,7 +29,7 @@
 //! `--retention on|off` and `--frames <n>` narrow it down, and `--list` prints
 //! the scenarios instead. `--rate <tier>` sets how fast the workspace's
 //! quotes stream: in `--auto`, one or more tiers, or `all`, to run the
-//! workspace's scenarios at each (`burst`, today's 60 Hz, by default); in the
+//! workspace's scenarios at each (`burst`, 960 a second, by default); in the
 //! showcase, the rate it opens the workspace streaming at. On macOS it holds
 //! the CPU's clock up while it measures; see `clock.rs`.
 //!
@@ -750,9 +750,9 @@ impl Showcase {
                 segmented("Quotes", cx).child(segment_track(cx).children(TOOLBAR_RATES.map(
                     |rate| {
                         let (label, what) = match rate {
-                            Rate::Normal => ("4 Hz", "a feed batched every 250 ms"),
-                            Rate::Busy => ("15 Hz", "a busy session"),
-                            _ => ("60 Hz", "a burst, every frame"),
+                            Rate::Normal => ("120/s", "trading hours"),
+                            Rate::Busy => ("360/s", "an active session"),
+                            _ => ("960/s", "the open, or news"),
                         };
                         let selected = quote_rate == rate;
                         // Clicking the rate streaming stops it.

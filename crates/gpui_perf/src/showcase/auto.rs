@@ -4,14 +4,14 @@
 //!
 //! The trading workspace's scenarios stream quotes into it while the user
 //! does nothing, scrolls the watchlist, or moves the pointer over its rows,
-//! at each rate `--rate` names (`gpui_perf::rate`; `burst`, a batch every
-//! frame, by default, as before there were rates), reported as
+//! quotes arriving at random times at each mean rate `--rate` names
+//! (`gpui_perf::rate`; `burst`, 960 a second, by default), reported as
 //! `WorkspaceQuotes@calm` and the like.
 //!
 //! At the slower rates most frames draw nothing. The per-frame columns count
 //! only the frames drawn, and `proc` and `main`, the CPU the process and its
-//! main thread used over the run, show how idle it was. A run lasts at least
-//! eight ticks of its rate. The run itself asks for a frame at every vsync,
+//! main thread used over the run, show how idle it was. A run lasts long
+//! enough for about 64 quotes to arrive. The run itself asks for a frame at every vsync,
 //! to step, even when nothing is drawn, so `WorkspaceQuotes@idle` shows that
 //! floor.
 
@@ -90,9 +90,6 @@ pub fn list() {
         println!("{:<16} {}", rate.name(), rate.description());
     }
 }
-
-/// How many ticks of its rate a workspace run lasts at least.
-const MIN_TICKS: u32 = 8;
 
 /// One scenario, with retention on, off, or neither where GPUI has no
 /// retained views, and for the workspace's, at a quote rate.
@@ -297,13 +294,11 @@ impl AutoRun {
                         showcase.set_quote_rate(rate, window, cx);
                     }
                     if let Some(workspace) = showcase.container.read(cx).workspace.clone() {
-                        let quotes = match scenario {
-                            Scenario::WorkspaceScroll | Scenario::WorkspaceHover => {
-                                rate.quotes_per_tick() / 2
-                            }
-                            _ => rate.quotes_per_tick(),
+                        let share = match scenario {
+                            Scenario::WorkspaceScroll | Scenario::WorkspaceHover => 0.5,
+                            _ => 1.,
                         };
-                        workspace.update(cx, |workspace, _| workspace.quotes_per_tick = quotes);
+                        workspace.update(cx, |workspace, _| workspace.quote_share = share);
                     }
                     showcase.select(page, cx);
                     showcase.focus_page(window, cx);
@@ -339,9 +334,7 @@ impl AutoRun {
         self.last_frames = Some(frames);
 
         self.frame += 1;
-        let min_duration = rate
-            .and_then(Rate::every)
-            .map_or(Duration::ZERO, |every| every * MIN_TICKS);
+        let min_duration = rate.map_or(Duration::ZERO, Rate::min_duration);
         if self.frame > WARMUP_FRAMES + self.measured_frames
             && self
                 .measuring_since

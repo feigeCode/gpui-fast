@@ -1,7 +1,7 @@
 //! The trading workspace page: a docked window of market panels built the way
 //! Longbridge Pro builds its main window on GPUI Kit, with a live stream of
-//! quotes that a timer pushes in, at one of the rates of `gpui_perf::rate`:
-//! from once a second to every frame.
+//! quotes arriving at random times, as a real feed's do, at one of the mean
+//! rates of `gpui_perf::rate`.
 //!
 //! The component pages keep to one screen. A real application puts many of
 //! them in one window and wires them to a shared data feed, and most of what
@@ -37,7 +37,12 @@
 //! The same workspace, without a window, is the headless `workspace-*`
 //! scenarios in `scenarios/workspace.rs`.
 
-use std::{cell::Cell, ops::Range, rc::Rc};
+use std::{
+    cell::Cell,
+    ops::Range,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use gpui::{
     AnyView, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
@@ -46,7 +51,7 @@ use gpui::{
     div, fill, point, prelude::*, px, relative, rems, size, transparent_black, uniform_list,
 };
 
-use gpui_perf::rate::Rate;
+use gpui_perf::rate::{Feed, Rate};
 
 use super::theme::{Theme, theme};
 
@@ -223,15 +228,23 @@ impl QuoteStore {
     }
 }
 
-/// Which symbol the `i`th quote of a tick is for: the quote panels' symbol
-/// first every other tick, then a few rows of the watchlist's first screen,
-/// so that rows in view change every tick, then the rest of the list.
-fn quote_symbol(tick: usize, i: usize) -> usize {
-    match i {
-        0 if tick.is_multiple_of(2) => SELECTED,
-        1..=4 => (tick * 5 + i * 11) % FIRST_SCREEN,
-        _ => (tick * 7 + i * 13) % SYMBOLS,
+/// Which symbol a quote is for, from the random number the feed drew for it:
+/// the quote panels' symbol one time in 32, a row of the watchlist's first
+/// screen one in four, and otherwise any symbol of the list.
+fn quote_symbol(random: u64) -> usize {
+    let pick = (random >> 8) as usize;
+    match random % 32 {
+        0 => SELECTED,
+        1..=8 => pick % FIRST_SCREEN,
+        _ => pick % SYMBOLS,
     }
+}
+
+/// Whether a quote is one of the `share` of the feed's quotes the workspace
+/// takes; taking a random share of a Poisson process's events leaves a
+/// Poisson process.
+fn takes(random: u64, share: f64) -> bool {
+    (((random >> 40) % 1024) as f64) < share * 1024.
 }
 
 /// The feed every panel subscribes to.
@@ -326,12 +339,15 @@ pub struct Workspace {
     /// background tabs and closed docks do.
     _hidden: Vec<Entity<HiddenPanel>>,
     stream: Option<Task<()>>,
-    /// How often the stream pushes quotes, [`Rate::Idle`] while it doesn't.
+    /// How fast the stream pushes quotes, [`Rate::Idle`] while it doesn't.
     pub rate: Rate,
-    /// Quotes each tick of the stream pushes: the rate's, unless an
+    /// The share of the rate's quotes the stream pushes: all, unless an
     /// automatic run says otherwise.
-    pub quotes_per_tick: usize,
-    ticks: usize,
+    pub quote_share: f64,
+    /// Quotes pushed so far.
+    quotes: usize,
+    /// When the indices last ticked.
+    status_ticked: Instant,
 }
 
 impl Workspace {
@@ -396,20 +412,27 @@ impl Workspace {
             dock,
             stream: None,
             rate: Rate::Idle,
-            quotes_per_tick: 0,
-            ticks: 0,
+            quote_share: 1.,
+            quotes: 0,
+            status_ticked: Instant::now(),
         }
     }
 
-    /// Streams quotes at `rate`, or stops streaming them at [`Rate::Idle`].
+    /// Streams quotes at `rate`, each as it arrives, at random times, or
+    /// stops streaming them at [`Rate::Idle`].
     pub fn set_rate(&mut self, rate: Rate, window: &mut Window, cx: &mut Context<Self>) {
         self.rate = rate;
-        self.quotes_per_tick = rate.quotes_per_tick();
-        self.stream = rate.every().map(|every| {
+        self.stream = (rate != Rate::Idle).then(|| {
             cx.spawn_in(window, async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(every).await;
-                    if this.update(cx, |this, cx| this.tick(cx)).is_err() {
+                let mut feed = Feed::new(rate.quotes_per_second());
+                let started = Instant::now();
+                while let Some(next) = feed.next() {
+                    let wait = next.saturating_sub(started.elapsed());
+                    if !wait.is_zero() {
+                        cx.background_executor().timer(wait).await;
+                    }
+                    let quotes = feed.until(started.elapsed());
+                    if this.update(cx, |this, cx| this.push(&quotes, cx)).is_err() {
                         break;
                     }
                 }
@@ -417,22 +440,26 @@ impl Workspace {
         });
     }
 
-    /// Pushes one tick's quotes: each updates the store, which notifies the
-    /// watchlist, and goes out on the feed to every panel. The indices tick
-    /// every thirtieth time.
-    fn tick(&mut self, cx: &mut Context<Self>) {
-        self.ticks += 1;
-        let tick = self.ticks;
-        for i in 0..self.quotes_per_tick {
-            let symbol = quote_symbol(tick, i);
+    /// Pushes the quotes that arrived: each updates the store, which
+    /// notifies the watchlist, and goes out on the feed to every panel. The
+    /// indices tick at most twice a second.
+    fn push(&mut self, quotes: &[u64], cx: &mut Context<Self>) {
+        for &random in quotes {
+            if !takes(random, self.quote_share) {
+                continue;
+            }
+            self.quotes += 1;
+            let sequence = self.quotes;
+            let symbol = quote_symbol(random);
             let event = self.store.update(cx, |store, cx| {
-                let event = store.tick(symbol, tick);
+                let event = store.tick(symbol, sequence);
                 cx.notify();
                 event
             });
             self.feed.update(cx, |_, cx| cx.emit(event));
         }
-        if tick.is_multiple_of(30) {
+        if self.status_ticked.elapsed() >= Duration::from_millis(500) {
+            self.status_ticked = Instant::now();
             self.status.update(cx, |status, cx| {
                 status.tick += 1;
                 cx.notify();

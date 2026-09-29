@@ -32,10 +32,11 @@
 //!   down. `--only` takes a name `--auto --list` prints, or one with its
 //!   rate, `WorkspaceQuotes@calm`.
 //! - `--rate <tier>[,<tier>…]|all`: how fast quotes stream into the trading
-//!   workspace — `idle`, `calm` (1 Hz), `normal` (4 Hz), `busy` (15 Hz) or
-//!   `burst` (60 Hz); see `rate.rs`. `--auto` runs its Workspace scenarios at
-//!   each (`burst` by default, the rate they had before there were tiers);
-//!   the showcase opens the workspace streaming at the one given.
+//!   workspace, one by one at random times — `idle`, `calm` (8 a second),
+//!   `normal` (120), `busy` (360) or `burst` (960); see `rate.rs`. `--auto`
+//!   runs its Workspace scenarios at each (`burst` by default, as many quotes
+//!   a second as before there were tiers); the showcase opens the workspace
+//!   streaming at the one given.
 //! - `--no-hold-clock`: on macOS, measure `--auto` without holding the CPU's
 //!   clock up; see `showcase/clock.rs`.
 //!

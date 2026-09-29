@@ -38,14 +38,21 @@
 //! have the dock and the selection layer write their state only when it
 //! changes, which retained views need to draw them from last frame.
 //!
-//! Quotes arrive every frame, as in a burst of trading. The `-busy`,
-//! `-normal` and `-calm` scenarios have the feed tick every fourth,
-//! fifteenth or sixtieth frame instead, at the rates of `crate::rate`; the
-//! frames in between change nothing, and are not drawn or counted per frame.
+//! Sixteen quotes arrive every frame, the same ones every run, a baseline to
+//! compare builds by. A real feed's quotes arrive one by one, at random
+//! times: the `-burst`, `-busy`, `-normal` and `-calm` scenarios deliver them
+//! that way, at the mean rates of `crate::rate`, each frame getting those that
+//! arrived during its 1/60 s. Frames nothing arrived in change nothing, and
+//! are not drawn or counted per frame.
 
-use std::{cell::Cell, ops::Range, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+    rc::Rc,
+    time::Duration,
+};
 
-use crate::rate::Rate;
+use crate::rate::{Feed, Rate};
 
 use gpui::{
     AnyView, App, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
@@ -64,7 +71,7 @@ pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
             quiet: false,
             uncached: false,
             row_views: false,
-            rate: Rate::Burst,
+            feed: None,
         }),
         Box::new(WorkspaceScenario {
             name: "workspace-hover",
@@ -73,7 +80,7 @@ pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
             quiet: false,
             uncached: false,
             row_views: false,
-            rate: Rate::Burst,
+            feed: None,
         }),
         Box::new(WorkspaceScenario {
             name: "workspace-scroll",
@@ -82,7 +89,7 @@ pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
             quiet: false,
             uncached: false,
             row_views: false,
-            rate: Rate::Burst,
+            feed: None,
         }),
         Box::new(WorkspaceScenario {
             name: "workspace-quiet-quotes",
@@ -91,7 +98,7 @@ pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
             quiet: true,
             uncached: false,
             row_views: false,
-            rate: Rate::Burst,
+            feed: None,
         }),
         Box::new(WorkspaceScenario {
             name: "workspace-quiet-hover",
@@ -100,7 +107,7 @@ pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
             quiet: true,
             uncached: false,
             row_views: false,
-            rate: Rate::Burst,
+            feed: None,
         }),
         Box::new(WorkspaceScenario {
             name: "workspace-uncached-hover",
@@ -109,7 +116,7 @@ pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
             quiet: true,
             uncached: true,
             row_views: false,
-            rate: Rate::Burst,
+            feed: None,
         }),
         Box::new(WorkspaceScenario {
             name: "workspace-uncached-scroll",
@@ -118,7 +125,7 @@ pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
             quiet: true,
             uncached: true,
             row_views: false,
-            rate: Rate::Burst,
+            feed: None,
         }),
         Box::new(WorkspaceScenario {
             name: "workspace-rowviews-quotes",
@@ -127,7 +134,7 @@ pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
             quiet: true,
             uncached: false,
             row_views: true,
-            rate: Rate::Burst,
+            feed: None,
         }),
         Box::new(WorkspaceScenario {
             name: "workspace-rowviews-hover",
@@ -136,7 +143,7 @@ pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
             quiet: true,
             uncached: false,
             row_views: true,
-            rate: Rate::Burst,
+            feed: None,
         }),
         Box::new(WorkspaceScenario {
             name: "workspace-rowviews-scroll",
@@ -145,7 +152,7 @@ pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
             quiet: true,
             uncached: false,
             row_views: true,
-            rate: Rate::Burst,
+            feed: None,
         }),
         Box::new(WorkspaceScenario {
             name: "workspace-quiet-scroll",
@@ -154,48 +161,61 @@ pub fn scenarios() -> Vec<Box<dyn crate::Scenario>> {
             quiet: true,
             uncached: false,
             row_views: false,
-            rate: Rate::Burst,
+            feed: None,
         }),
         tier(
+            "workspace-quotes-burst",
+            "workspace-quotes, with quotes arriving one by one at random times, 960 a second, as at the open.",
+            false,
+            Rate::Burst,
+        ),
+        tier(
             "workspace-quotes-busy",
-            "workspace-quotes, with the feed ticking every fourth frame (15 Hz), twenty-four quotes a tick.",
+            "workspace-quotes, with quotes arriving one by one at random times, 360 a second, as in an active session.",
             false,
             Rate::Busy,
         ),
         tier(
             "workspace-quotes-normal",
-            "workspace-quotes, with the feed ticking every fifteenth frame (4 Hz, a feed batched every 250 ms), thirty-two quotes a tick.",
+            "workspace-quotes, with quotes arriving one by one at random times, 120 a second, as in a watchlist during trading hours.",
             false,
             Rate::Normal,
         ),
         tier(
             "workspace-quotes-calm",
-            "workspace-quotes, with the feed ticking once a second, eight quotes a tick, as in a quiet market.",
+            "workspace-quotes, with quotes arriving one by one at random times, 8 a second, as in a quiet market.",
             false,
             Rate::Calm,
         ),
         tier(
+            "workspace-quiet-quotes-burst",
+            "workspace-quiet-quotes, with quotes arriving one by one at random times, 960 a second, as at the open.",
+            true,
+            Rate::Burst,
+        ),
+        tier(
             "workspace-quiet-quotes-busy",
-            "workspace-quiet-quotes, with the feed ticking every fourth frame (15 Hz), twenty-four quotes a tick.",
+            "workspace-quiet-quotes, with quotes arriving one by one at random times, 360 a second, as in an active session.",
             true,
             Rate::Busy,
         ),
         tier(
             "workspace-quiet-quotes-normal",
-            "workspace-quiet-quotes, with the feed ticking every fifteenth frame (4 Hz, a feed batched every 250 ms), thirty-two quotes a tick.",
+            "workspace-quiet-quotes, with quotes arriving one by one at random times, 120 a second, as in a watchlist during trading hours.",
             true,
             Rate::Normal,
         ),
         tier(
             "workspace-quiet-quotes-calm",
-            "workspace-quiet-quotes, with the feed ticking once a second, eight quotes a tick, as in a quiet market.",
+            "workspace-quiet-quotes, with quotes arriving one by one at random times, 8 a second, as in a quiet market.",
             true,
             Rate::Calm,
         ),
     ]
 }
 
-/// The workspace at rest while the feed ticks at `rate`; see [`Rate`].
+/// The workspace at rest while quotes arrive at random times at `rate`;
+/// see [`Rate`].
 fn tier(
     name: &'static str,
     description: &'static str,
@@ -209,7 +229,7 @@ fn tier(
         quiet,
         uncached: false,
         row_views: false,
-        rate,
+        feed: Some((rate, RefCell::new(Feed::new(rate.quotes_per_second())))),
     })
 }
 
@@ -253,10 +273,11 @@ struct WorkspaceScenario {
     /// and notified alone when it ticks, rather than rows the watchlist
     /// renders from the quote store.
     row_views: bool,
-    /// How often the feed ticks, in frames of a 60 Hz display, and how many
-    /// quotes a tick delivers: every frame, sixteen (eight while the user
-    /// hovers or scrolls), in all but the rate tiers.
-    rate: Rate,
+    /// Quotes arriving one by one at random times, at a rate, in the rate
+    /// tiers. Otherwise sixteen quotes arrive every frame (eight while the
+    /// user hovers or scrolls), the same ones every run, as a baseline to
+    /// compare builds by.
+    feed: Option<(Rate, RefCell<Feed>)>,
 }
 
 impl crate::Scenario for WorkspaceScenario {
@@ -269,7 +290,7 @@ impl crate::Scenario for WorkspaceScenario {
     }
 
     fn skips_clean_frames(&self) -> bool {
-        self.rate != Rate::Burst
+        self.feed.is_some()
     }
 
     fn build(&self, window: &mut Window, cx: &mut App) -> AnyView {
@@ -293,17 +314,36 @@ impl crate::Scenario for WorkspaceScenario {
                 workspace.rows.clone(),
             )
         };
-        let tick = self.rate.tick_at(frame);
-        let quotes = match self.kind {
-            Kind::Quotes => self.rate.quotes_per_tick(),
-            Kind::Hover | Kind::Scroll => self.rate.quotes_per_tick() / 2,
+        // (symbol, what moves its price) for each quote of the frame.
+        let quotes: Vec<(usize, usize)> = match &self.feed {
+            None => {
+                let quotes = match self.kind {
+                    Kind::Quotes => 16,
+                    Kind::Hover | Kind::Scroll => 8,
+                };
+                (0..quotes)
+                    .map(|i| (quote_symbol(frame, i), frame))
+                    .collect()
+            }
+            Some((_, arrivals)) => {
+                // The quotes that arrived by the end of this frame, of a
+                // 60 Hz display.
+                let share = match self.kind {
+                    Kind::Quotes => 1.,
+                    Kind::Hover | Kind::Scroll => 0.5,
+                };
+                arrivals
+                    .borrow_mut()
+                    .until(Duration::from_secs_f64((frame + 1) as f64 / 60.))
+                    .into_iter()
+                    .filter(|&random| takes(random, share))
+                    .map(|random| (random_symbol(random), (random >> 16) as usize))
+                    .collect()
+            }
         };
-        let quotes = if tick.is_some() { quotes } else { 0 };
-        let tick = tick.unwrap_or(0);
-        for i in 0..quotes {
-            let symbol = quote_symbol(tick, i);
+        for &(symbol, seed) in &quotes {
             let event = store.update(cx, |store, cx| {
-                let event = store.tick(symbol, tick);
+                let event = store.tick(symbol, seed);
                 cx.notify();
                 event
             });
@@ -316,7 +356,7 @@ impl crate::Scenario for WorkspaceScenario {
             }
             feed.update(cx, |_, cx| cx.emit(event));
         }
-        if quotes > 0 && tick.is_multiple_of(30) {
+        if !quotes.is_empty() && frame.is_multiple_of(30) {
             status.update(cx, |status, cx| {
                 status.tick += 1;
                 cx.notify();
@@ -540,6 +580,25 @@ fn quote_symbol(frame: usize, i: usize) -> usize {
         1..=4 => (frame * 5 + i * 11) % FIRST_SCREEN,
         _ => (frame * 7 + i * 13) % SYMBOLS,
     }
+}
+
+/// Which symbol a quote arriving at random is for, from the random number the
+/// feed drew for it: the quote panels' symbol one time in 32, a row of the
+/// watchlist's first screen one in four, and otherwise any symbol.
+fn random_symbol(random: u64) -> usize {
+    let pick = (random >> 8) as usize;
+    match random % 32 {
+        0 => SELECTED,
+        1..=8 => pick % FIRST_SCREEN,
+        _ => pick % SYMBOLS,
+    }
+}
+
+/// Whether a quote is one of the `share` of the feed's quotes the workspace
+/// takes; taking a random share of a Poisson process's events leaves a
+/// Poisson process.
+fn takes(random: u64, share: f64) -> bool {
+    (((random >> 40) % 1024) as f64) < share * 1024.
 }
 
 /// The feed every panel subscribes to.
