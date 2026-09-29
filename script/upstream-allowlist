@@ -14,3 +14,4 @@ crates/gpui/src/view.rs removed=210 # ViewElement's cache-by-bounds is replaced 
 crates/gpui/src/taffy.rs removed=50 # request_layout, request_measured_layout and stretch_auto_size_to_fill bodies are replaced by fast::layout's retained nodes; they forward to it
 crates/gpui/src/elements/list.rs added=75 # each item is laid out through fast::layout_key::layout_as_list_item, a call rustfmt spreads over seven lines at the list's depth; the rest are one-line state-version hooks
 crates/gpui/src/key_dispatch.rs removed=55 # reuse_subtree's node-by-node copy is replaced by fast::dispatch::copy_nodes, which writes a reused stretch in one pass, and move_node, used only by it, goes with it; the listener lists become fast::dispatch::Listeners, a one-word change per field
+crates/gpui_apple/src/metal_renderer.rs hunk=10 # draw_primitives_to_texture returns the command buffer fast::paths encodes when the frame has paths, a call rustfmt spreads over ten lines

@@ -116,9 +116,9 @@ pub struct MetalRenderer {
     is_unified_memory: bool,
     presents_with_transaction: bool,
     /// For headless rendering, tracks whether output should be opaque
-    opaque: bool,
-    command_queue: CommandQueue,
-    paths_rasterization_pipeline_state: metal::RenderPipelineState,
+    pub(crate) opaque: bool,
+    pub(crate) command_queue: CommandQueue,
+    pub(crate) paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
@@ -131,8 +131,8 @@ pub struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
-    path_intermediate_texture: Option<metal::Texture>,
-    path_intermediate_msaa_texture: Option<metal::Texture>,
+    pub(crate) path_intermediate_texture: Option<metal::Texture>,
+    pub(crate) path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
@@ -663,6 +663,16 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        if let Some(command_buffer) = crate::fast::paths::draw_primitives_to_texture(
+            self,
+            scene,
+            instance_bindings,
+            writer,
+            texture,
+            viewport_size,
+        )? {
+            return Ok(command_buffer);
+        }
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
@@ -817,7 +827,7 @@ impl MetalRenderer {
         Ok(true)
     }
 
-    fn draw_shadows(
+    pub(crate) fn draw_shadows(
         &self,
         shadows: Range<usize>,
         instance_bindings: &InstanceBindings,
@@ -859,7 +869,7 @@ impl MetalRenderer {
         );
     }
 
-    fn draw_quads(
+    pub(crate) fn draw_quads(
         &self,
         quads: Range<usize>,
         instance_bindings: &InstanceBindings,
@@ -901,7 +911,7 @@ impl MetalRenderer {
         );
     }
 
-    fn draw_paths_from_intermediate(
+    pub(crate) fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
         writer: &mut InstanceBufferWriter,
@@ -972,7 +982,7 @@ impl MetalRenderer {
         Ok(())
     }
 
-    fn draw_underlines(
+    pub(crate) fn draw_underlines(
         &self,
         underlines: Range<usize>,
         instance_bindings: &InstanceBindings,
@@ -1014,7 +1024,7 @@ impl MetalRenderer {
         );
     }
 
-    fn draw_monochrome_sprites(
+    pub(crate) fn draw_monochrome_sprites(
         &self,
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
@@ -1068,7 +1078,7 @@ impl MetalRenderer {
         );
     }
 
-    fn draw_polychrome_sprites(
+    pub(crate) fn draw_polychrome_sprites(
         &self,
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
@@ -1122,7 +1132,7 @@ impl MetalRenderer {
         );
     }
 
-    fn draw_surfaces(
+    pub(crate) fn draw_surfaces(
         &mut self,
         surfaces: &[PaintSurface],
         first_surface: usize,
@@ -1211,7 +1221,7 @@ impl MetalRenderer {
     }
 }
 
-fn new_command_encoder_for_texture<'a>(
+pub(crate) fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &'a metal::TextureRef,
     viewport_size: Size<DevicePixels>,
@@ -1381,12 +1391,12 @@ fn build_path_rasterization_pipeline_state(
 }
 
 #[derive(Clone)]
-struct InstanceBinding {
-    buffer: metal::Buffer,
-    offset: usize,
+pub(crate) struct InstanceBinding {
+    pub(crate) buffer: metal::Buffer,
+    pub(crate) offset: usize,
 }
 
-struct InstanceBindings {
+pub(crate) struct InstanceBindings {
     quads: InstanceBinding,
     shadows: InstanceBinding,
     underlines: InstanceBinding,
@@ -1409,7 +1419,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
     })
 }
 
-struct InstanceBufferWriter {
+pub(crate) struct InstanceBufferWriter {
     device: metal::Device,
     pool: Arc<Mutex<InstanceBufferPool>>,
     unified_memory: bool,
@@ -1469,7 +1479,7 @@ impl InstanceBufferWriter {
         Ok(binding)
     }
 
-    fn write_iter<T>(
+    pub(crate) fn write_iter<T>(
         &mut self,
         values: impl ExactSizeIterator<Item = T>,
     ) -> Result<InstanceBinding> {
@@ -1581,7 +1591,7 @@ enum SurfaceInputIndex {
 }
 
 #[repr(C)]
-enum PathRasterizationInputIndex {
+pub(crate) enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
 }
