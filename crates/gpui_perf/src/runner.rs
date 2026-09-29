@@ -171,6 +171,10 @@ pub struct RunReport {
     pub frame: Summary,
     /// The same, in wall time.
     pub frame_wall: Summary,
+    /// Main-thread instructions per frame, the mean, in millions, where the
+    /// CPU counts them: unlike time, it doesn't depend on what else the
+    /// machine is doing.
+    pub instructions_m: Option<f64>,
     /// What `Scenario::step` itself took; not part of `frame`.
     pub step: Summary,
     pub phases: PhaseAverages,
@@ -339,6 +343,7 @@ fn open(
 struct Stamp {
     wall: Instant,
     cpu: Option<Duration>,
+    instructions: Option<u64>,
 }
 
 impl Stamp {
@@ -346,7 +351,14 @@ impl Stamp {
         Self {
             wall: Instant::now(),
             cpu: thread_cpu_time(),
+            instructions: crate::instructions::main_thread_instructions(),
         }
+    }
+
+    /// Instructions retired since `self`, where the CPU counts them.
+    fn instructions_since(&self) -> Option<u64> {
+        let now = crate::instructions::main_thread_instructions()?;
+        Some(now.saturating_sub(self.instructions?))
     }
 
     /// (cpu-or-wall, wall) elapsed since `self`.
@@ -381,6 +393,9 @@ struct FrameSample {
     /// CPU (or wall) time of the frame, step excluded.
     cost: Duration,
     cost_wall: Duration,
+    /// Main-thread instructions of the frame, step excluded, where the CPU
+    /// counts them.
+    instructions: Option<u64>,
     step: Duration,
     forced: bool,
     allocations: u64,
@@ -405,11 +420,12 @@ fn frame(
 
     let allocations_before = allocations();
     let start = Stamp::now();
-    let (step, step_wall, step_allocations) = cx
+    let (step, step_wall, step_allocations, step_instructions) = cx
         .update_window(window, |_, window, cx| {
             let allocations_before = allocations();
             let start = Stamp::now();
             scenario.step(root, frame, window, cx);
+            let step_instructions = start.instructions_since();
             let (step, step_wall) = start.elapsed();
             let allocations_after = allocations();
             (
@@ -419,11 +435,15 @@ fn frame(
                     allocations_after.0 - allocations_before.0,
                     allocations_after.1 - allocations_before.1,
                 ),
+                step_instructions,
             )
         })
         .unwrap();
     cx.run_until_parked();
     let (mut cost, mut cost_wall) = start.elapsed();
+    let mut instructions = start
+        .instructions_since()
+        .map(|all| all.saturating_sub(step_instructions.unwrap_or(0)));
     cost = cost.saturating_sub(step);
     cost_wall = cost_wall.saturating_sub(step_wall);
 
@@ -433,15 +453,18 @@ fn frame(
         cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         cx.run_until_parked();
+        let forced_instructions = start.instructions_since();
         let (cpu, wall) = start.elapsed();
         cost += cpu;
         cost_wall += wall;
+        instructions = instructions.zip(forced_instructions).map(|(a, b)| a + b);
     }
     let allocations_after = allocations();
 
     FrameSample {
         cost,
         cost_wall,
+        instructions,
         step,
         forced,
         allocations: (allocations_after.0 - allocations_before.0)
@@ -466,6 +489,7 @@ fn measure(index: usize, retention: bool, options: &Options) -> RunReport {
 
     let mut costs = Vec::with_capacity(options.frames);
     let mut costs_wall = Vec::with_capacity(options.frames);
+    let mut instructions = Some(Vec::with_capacity(options.frames));
     let mut steps = Vec::with_capacity(options.frames);
     let mut forced_draws = 0;
     let mut allocation_count = 0;
@@ -474,6 +498,10 @@ fn measure(index: usize, retention: bool, options: &Options) -> RunReport {
         let sample = frame(&mut cx, window, &*scenario, &root, options.warmup + n);
         costs.push(sample.cost);
         costs_wall.push(sample.cost_wall);
+        match (&mut instructions, sample.instructions) {
+            (Some(all), Some(count)) => all.push(count),
+            _ => instructions = None,
+        }
         steps.push(sample.step);
         forced_draws += sample.forced as usize;
         allocation_count += sample.allocations;
@@ -492,6 +520,8 @@ fn measure(index: usize, retention: bool, options: &Options) -> RunReport {
         cpu_clock: thread_cpu_time().is_some(),
         frame: Summary::of(&costs),
         frame_wall: Summary::of(&costs_wall),
+        instructions_m: instructions
+            .map(|all| all.iter().sum::<u64>() as f64 / all.len().max(1) as f64 / 1e6),
         step: Summary::of(&steps),
         phases: PhaseAverages::of(&stats, options.frames),
         allocations: allocation_count as f64 / frames,
@@ -637,12 +667,13 @@ pub fn format_reports(reports: &[ScenarioReport]) -> String {
         let _ = writeln!(out);
 
         type Row = (&'static str, fn(&RunReport) -> f64, usize);
-        let rows: [Row; 21] = [
+        let rows: [Row; 22] = [
             ("frame mean ms", |r| r.frame.mean_ms, 3),
             ("frame p50 ms", |r| r.frame.p50_ms, 3),
             ("frame p95 ms", |r| r.frame.p95_ms, 3),
             ("frame max ms", |r| r.frame.max_ms, 3),
             ("wall mean ms", |r| r.frame_wall.mean_ms, 3),
+            ("instructions M", |r| r.instructions_m.unwrap_or(0.), 2),
             ("  build ms", |r| r.phases.build_ms, 3),
             ("  prepaint ms", |r| r.phases.prepaint_ms, 3),
             ("    layout ms", |r| r.phases.compute_layout_ms, 3),

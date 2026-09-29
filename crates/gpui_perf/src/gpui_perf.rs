@@ -14,6 +14,7 @@
 extern crate gpui_fast as gpui;
 
 pub mod alloc;
+pub mod instructions;
 #[cfg(feature = "fast")]
 pub mod runner;
 #[cfg(feature = "fast")]
