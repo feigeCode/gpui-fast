@@ -200,6 +200,9 @@ pub(crate) struct RetainedState {
     pub(crate) view_retention: bool,
     /// Records reads of the pointer and modifier keys while views are drawn.
     pub(crate) ambient_reads: crate::fast::dependencies::AmbientReads,
+    /// Room to sort out the layout keys a spliced view keeps, kept from one
+    /// splice to the next. See [`crate::fast::splice`].
+    pub(crate) splice_keys: FxHashSet<u64>,
 }
 
 impl RetainedState {
@@ -215,6 +218,7 @@ impl RetainedState {
             prebuilt: FxHashMap::default(),
             notified_entities: FxHashSet::default(),
             view_retention: std::env::var("GPUI_VIEW_RETENTION").map_or(true, |value| value != "0"),
+            splice_keys: FxHashSet::default(),
         }
     }
 

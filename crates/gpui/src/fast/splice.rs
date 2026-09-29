@@ -328,16 +328,12 @@ impl Window {
             return None;
         }
 
-        let gap_keys: FxHashSet<u64> = gaps
-            .iter()
-            .flat_map(|&gap| records[gap].layout.as_ref().unwrap().keys.iter().copied())
-            .collect();
-        let kept: Vec<u64> = layout
-            .keys
-            .iter()
-            .copied()
-            .filter(|key| !gap_keys.contains(key))
-            .collect();
+        let kept = kept_keys(
+            &layout.keys,
+            gaps.iter()
+                .map(|&gap| records[gap].layout.as_ref().unwrap().keys.as_slice()),
+            &mut self.retained_state.splice_keys,
+        );
         let element_states = layout.element_states.clone();
         let dependencies = record.dependencies.clone();
         let engine = self.layout_engine.as_mut().unwrap();
@@ -537,16 +533,12 @@ impl Window {
         let record = &source.records[previous];
         let prepaint_range = record.prepaint_range.clone();
         let last = previous + record.nested;
-        let gap_layout_keys: FxHashSet<u64> = gaps
-            .iter()
-            .flat_map(|gap| source.records[gap.record].layout_keys.iter().copied())
-            .collect();
-        let kept_layout_keys: Vec<u64> = record
-            .layout_keys
-            .iter()
-            .copied()
-            .filter(|key| !gap_layout_keys.contains(key))
-            .collect();
+        let kept_layout_keys = kept_keys(
+            &record.layout_keys,
+            gaps.iter()
+                .map(|gap| &*source.records[gap.record].layout_keys),
+            &mut self.retained_state.splice_keys,
+        );
         let mut own = copy_record(record, prepaint_range.clone(), 0);
         // Painted by `splice_paint`, if at all.
         own.paint = PaintStatus::Unpainted;
@@ -579,13 +571,13 @@ impl Window {
 
             let segment_start = self.prepaint_index();
             self.copy_prepaint_segment(cursor.clone()..gap_range.start.clone(), &mut dispatch);
-            copied.extend(self.copy_records(
+            self.copy_records(
                 next_record..gap.record,
                 &cursor,
                 &segment_start,
-                segment,
-                index,
-            ));
+                (segment, index),
+                &mut copied,
+            );
 
             // The gap hangs off the dispatch node it hung off last frame.
             let parent =
@@ -618,13 +610,13 @@ impl Window {
         let segment = gaps.len();
         let segment_start = self.prepaint_index();
         self.copy_prepaint_segment(cursor.clone()..prepaint_range.end, &mut dispatch);
-        copied.extend(self.copy_records(
+        self.copy_records(
             next_record..last + 1,
             &cursor,
             &segment_start,
-            segment,
-            index,
-        ));
+            (segment, index),
+            &mut copied,
+        );
         dispatch.close(&mut self.next_frame.dispatch_tree);
         let end = self.prepaint_index();
 
@@ -723,19 +715,19 @@ impl Window {
 
     /// Copies last frame's records `records`, whose prepaint was copied from
     /// `from` on to `to`, into this frame inside the spliced view `anchor`,
-    /// returning where they went and `segment`, for their paint to be shifted
-    /// by it.
+    /// adding to `copied` where they went and `segment`, for their paint to
+    /// be shifted by it.
     fn copy_records(
         &mut self,
         records: Range<usize>,
         from: &PrepaintStateIndex,
         to: &PrepaintStateIndex,
-        segment: usize,
-        anchor: usize,
-    ) -> Vec<(usize, usize)> {
+        (segment, anchor): (usize, usize),
+        copied: &mut Vec<(usize, usize)>,
+    ) {
         let source = &self.rendered_frame.retained;
         let target = &mut self.next_frame.retained;
-        let mut copied = Vec::with_capacity(records.len());
+        copied.reserve(records.len());
         for index in records {
             let record = &source.records[index];
             let prepaint_range = record.prepaint_range.start.shifted(from, to)
@@ -747,7 +739,6 @@ impl Window {
             }
             copied.push((target.push(copy), segment));
         }
-        copied
     }
 
     /// Paints the view [`Window::splice_prepaint`] prepainted: last frame's
@@ -824,10 +815,12 @@ impl Window {
 
         // Its hovers: its own, the copied records', and the gaps' new ones,
         // which painting them added.
-        let gap_hovers = self.retained_state.hover_dependencies[hovers_start..].to_vec();
-        let mut hovers = own_hovers.to_vec();
+        let gap_hovers = &self.retained_state.hover_dependencies[hovers_start..];
+        let mut hovers =
+            Vec::with_capacity(own_hovers.len() + copied_hovers.len() + gap_hovers.len());
+        hovers.extend_from_slice(&own_hovers);
         hovers.extend_from_slice(&copied_hovers);
-        hovers.extend_from_slice(&gap_hovers);
+        hovers.extend_from_slice(gap_hovers);
         let record = &mut self.next_frame.retained.records[*index];
         record.paint_range = start..end;
         record.paint = PaintStatus::Painted { source: None };
@@ -837,9 +830,7 @@ impl Window {
 
         // As for a view drawn from last frame, a hover found changed only now
         // builds it on the next frame.
-        let mut copied_checked = own_hovers.to_vec();
-        copied_checked.extend_from_slice(&copied_hovers);
-        if !self.hovers_unchanged(&copied_checked) {
+        if !(self.hovers_unchanged(&own_hovers) && self.hovers_unchanged(&copied_hovers)) {
             self.retained_state
                 .subtrees_dirty_next_frame
                 .extend(self.retained_state.subtree_stack.iter().cloned());
@@ -958,4 +949,83 @@ impl OpenDispatchCopy {
             .expect("a copied deferred draw hangs off a copied node");
         DispatchNodeId(node.0 - range.start + start)
     }
+}
+
+/// `keys` without the keys of `gaps`, in their order: the layout nodes a view
+/// drawn from last frame keeps, besides those of the nested views built
+/// again in it.
+///
+/// Keys are recorded in the order they are claimed, so a nested view's keys
+/// usually lie in the view's in one stretch, and the gaps' stretches follow
+/// one another as the gaps do. When they do, only the keys outside those
+/// stretches can be kept, and only those are looked up; when the stretches
+/// cover every key, none is kept and nothing is looked up. Otherwise the
+/// gaps' keys are gathered into `scratch`, which keeps its room from one
+/// splice to the next.
+pub(crate) fn kept_keys<'a>(
+    keys: &[u64],
+    gaps: impl Iterator<Item = &'a [u64]> + Clone,
+    scratch: &mut FxHashSet<u64>,
+) -> Vec<u64> {
+    scratch.clear();
+    let mut outside: SmallVec<[Range<usize>; 4]> = SmallVec::new();
+    let mut cursor = 0;
+    let mut in_stretches = true;
+    for gap in gaps.clone() {
+        let Some(&first) = gap.first() else {
+            continue;
+        };
+        let start = keys[cursor..]
+            .iter()
+            .position(|&key| key == first)
+            .map(|offset| cursor + offset);
+        match start {
+            Some(start) if keys.get(start..start + gap.len()) == Some(gap) => {
+                if start > cursor {
+                    outside.push(cursor..start);
+                }
+                cursor = start + gap.len();
+            }
+            _ => {
+                in_stretches = false;
+                break;
+            }
+        }
+    }
+
+    if !in_stretches {
+        scratch.extend(gaps.flatten().copied());
+        let kept = keys
+            .iter()
+            .copied()
+            .filter(|key| !scratch.contains(key))
+            .collect();
+        scratch.clear();
+        return kept;
+    }
+    if cursor < keys.len() {
+        outside.push(cursor..keys.len());
+    }
+    if outside.is_empty() {
+        return Vec::new();
+    }
+    // A key outside the stretches may still be a gap's, recorded twice.
+    scratch.extend(
+        outside
+            .iter()
+            .flat_map(|range| keys[range.clone()].iter().copied()),
+    );
+    for key in gaps.flatten() {
+        scratch.remove(key);
+        if scratch.is_empty() {
+            break;
+        }
+    }
+    let kept = outside
+        .iter()
+        .flat_map(|range| keys[range.clone()].iter().copied())
+        .filter(|key| scratch.contains(key))
+        .collect();
+    scratch.clear();
+    kept
 }
