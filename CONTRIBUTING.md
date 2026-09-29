@@ -62,9 +62,9 @@ setting one up.
 
 - The toolbar picks what scrolls itself — `Off`, `Sidebar`, `Page`, `Table`
   (keys `1`–`4`) — and switches `Refresh data` (`R`), which updates table
-  rows every 33 ms, and `Retained views` (`V`). `Quotes` sets how fast quotes
-  stream into the trading workspace — off, 1, 4, 15 or 60 Hz, the rate tiers
-  below — and `Q` steps to the next. The arrow keys move through the sidebar.
+  rows every 33 ms, and `Retained views` (`V`). `Quotes` streams quotes into
+  the trading workspace at 4, 15 or 60 Hz, the `normal`, `busy` and `burst`
+  tiers below; clicking the selected rate, or `Q` past 60 Hz, stops it. The arrow keys move through the sidebar.
 - The status bar shows, every half second: frames per second, the CPU of the
   whole process and of the main thread, on macOS the share of that CPU time
   spent on performance cores, the process's memory (resident on Linux, its

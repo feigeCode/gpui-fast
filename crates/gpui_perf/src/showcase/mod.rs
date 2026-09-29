@@ -16,7 +16,7 @@
 //! subscribes to, which a timer streams quotes into; see `workspace.rs`.
 //!
 //! The toolbar picks what scrolls itself and how fast the workspace's quotes
-//! stream — off, or one of the rates of `gpui_perf::rate` — and switches the
+//! stream — 4, 15 or 60 Hz, of the rates of `gpui_perf::rate` — and switches the
 //! data refresh and retained views. Every command has a key: `1`–`6` for what
 //! scrolls, `R` for the refresh, `Q` for the next quote rate, `V` for retained views,
 //! and the arrow keys to move through the sidebar. The status bar shows,
@@ -747,43 +747,36 @@ impl Showcase {
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_refresh(window, cx))),
             )
             .child(
-                segmented("Quotes", cx).child(segment_track(cx).children(Rate::ALL.map(|rate| {
-                    let (label, tip) = match rate {
-                        Rate::Idle => ("Off", "Stop streaming quotes".to_string()),
-                        Rate::Calm => (
-                            "1 Hz",
-                            format!("Stream {}: a calm market", rate.description()),
-                        ),
-                        Rate::Normal => (
-                            "4 Hz",
-                            format!("Stream {}: a feed batched every 250 ms", rate.description()),
-                        ),
-                        Rate::Busy => (
-                            "15 Hz",
-                            format!("Stream {}: a busy session", rate.description()),
-                        ),
-                        Rate::Burst => (
-                            "60 Hz",
-                            format!("Stream {}: a burst, every frame", rate.description()),
-                        ),
-                    };
-                    segment(
-                        SharedString::from(format!("rate-{}", rate.name())),
-                        label,
-                        quote_rate == rate,
-                        cx,
-                    )
-                    // `Q` steps to the next rate.
-                    .tooltip(Tooltip::text(
-                        tip,
-                        (next_rate(quote_rate) == rate).then_some("Q"),
-                    ))
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.set_quote_rate(rate, window, cx)
-                        }),
-                    )
-                }))),
+                segmented("Quotes", cx).child(segment_track(cx).children(TOOLBAR_RATES.map(
+                    |rate| {
+                        let (label, what) = match rate {
+                            Rate::Normal => ("4 Hz", "a feed batched every 250 ms"),
+                            Rate::Busy => ("15 Hz", "a busy session"),
+                            _ => ("60 Hz", "a burst, every frame"),
+                        };
+                        let selected = quote_rate == rate;
+                        // Clicking the rate streaming stops it.
+                        let (tip, target) = if selected {
+                            ("Stop streaming quotes".to_string(), Rate::Idle)
+                        } else {
+                            (format!("Stream {}: {what}", rate.description()), rate)
+                        };
+                        segment(
+                            SharedString::from(format!("rate-{}", rate.name())),
+                            label,
+                            selected,
+                            cx,
+                        )
+                        // `Q` steps to the next rate.
+                        .tooltip(Tooltip::text(
+                            tip,
+                            (next_rate(quote_rate) == target).then_some("Q"),
+                        ))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.set_quote_rate(target, window, cx),
+                        ))
+                    },
+                ))),
             )
             // Upstream GPUI has no retained views to switch.
             .when_some(retention, |this, retention| {
@@ -901,10 +894,17 @@ impl Showcase {
     }
 }
 
-/// The quote rate after `rate`, from off up to `burst` and back to off.
+/// The quote rates the toolbar offers; `--rate` offers the rest.
+const TOOLBAR_RATES: [Rate; 3] = [Rate::Normal, Rate::Busy, Rate::Burst];
+
+/// The toolbar's quote rate after `rate`, from off up to `burst` and back to
+/// off.
 fn next_rate(rate: Rate) -> Rate {
-    let index = Rate::ALL.iter().position(|r| *r == rate).unwrap_or(0);
-    Rate::ALL[(index + 1) % Rate::ALL.len()]
+    match TOOLBAR_RATES.iter().position(|r| *r == rate) {
+        Some(index) if index + 1 < TOOLBAR_RATES.len() => TOOLBAR_RATES[index + 1],
+        Some(_) => Rate::Idle,
+        None => TOOLBAR_RATES[0],
+    }
 }
 
 /// `--rate`: one or more quote rates, comma-separated or repeated, or `all`.
