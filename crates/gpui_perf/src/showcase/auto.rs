@@ -3,13 +3,24 @@
 //! views, so built with the `upstream` feature it runs every scenario once.
 //!
 //! The trading workspace's scenarios stream quotes into it while the user
-//! does nothing, scrolls the watchlist, or moves the pointer over its rows.
+//! does nothing, scrolls the watchlist, or moves the pointer over its rows,
+//! at each rate `--rate` names (`gpui_perf::rate`; `burst`, a batch every
+//! frame, by default, as before there were rates), reported as
+//! `WorkspaceQuotes@calm` and the like.
+//!
+//! At the slower rates most frames draw nothing. The per-frame columns count
+//! only the frames drawn, and `proc` and `main`, the CPU the process and its
+//! main thread used over the run, show how idle it was. A run lasts at least
+//! eight ticks of its rate. The run itself asks for a frame at every vsync,
+//! to step, even when nothing is drawn, so `WorkspaceQuotes@idle` shows that
+//! floor.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::cell::RefCell;
 
 use gpui::{App, MouseMoveEvent, PlatformInput, Window, point, px};
+use gpui_perf::rate::Rate;
 
 use super::{
     BUTTON_PAGE, Driver, Handles, Scroll, backend,
@@ -17,7 +28,7 @@ use super::{
     list_page,
     metrics::{Cost, Sample, main_thread_cpu_time, main_thread_instructions},
     table_page,
-    workspace::{QUOTES_PER_TICK, WATCHLIST_ROW_HEIGHT},
+    workspace::WATCHLIST_ROW_HEIGHT,
     workspace_page,
 };
 
@@ -49,14 +60,12 @@ impl Scenario {
             Scenario::ScrollTable => "scrolling the data table",
             Scenario::RefreshTable => "refreshing the data table's rows every 33 ms",
             Scenario::ScrollList => "scrolling a list of messages",
-            Scenario::WorkspaceQuotes => {
-                "workspace: quotes streaming, 16 every 16 ms, to every panel"
-            }
+            Scenario::WorkspaceQuotes => "workspace: quotes streaming to every panel",
             Scenario::WorkspaceScroll => {
-                "workspace: scrolling the watchlist, with 8 quotes every 16 ms"
+                "workspace: scrolling the watchlist, with half the rate's quotes a tick"
             }
             Scenario::WorkspaceHover => {
-                "workspace: hovering rows of the watchlist, with 8 quotes every 16 ms"
+                "workspace: hovering rows of the watchlist, with half the rate's quotes a tick"
             }
         }
     }
@@ -69,10 +78,38 @@ impl Scenario {
     }
 }
 
-/// Prints every scenario `--only` can pick.
+/// Prints every scenario `--only` can pick, and the rates `--rate` can.
 pub fn list() {
     for scenario in SCENARIOS {
         println!("{:<16} {}", format!("{scenario:?}"), scenario.description());
+    }
+    println!(
+        "\n--rate, for the Workspace scenarios (burst by default; several, comma-separated, or all):"
+    );
+    for rate in Rate::ALL {
+        println!("{:<16} {}", rate.name(), rate.description());
+    }
+}
+
+/// How many ticks of its rate a workspace run lasts at least.
+const MIN_TICKS: u32 = 8;
+
+/// One scenario, with retention on, off, or neither where GPUI has no
+/// retained views, and for the workspace's, at a quote rate.
+#[derive(Clone, Copy)]
+struct Run {
+    scenario: Scenario,
+    retention: Option<bool>,
+    rate: Option<Rate>,
+}
+
+impl Run {
+    /// The scenario's name, and its rate's: `WorkspaceQuotes@calm`.
+    fn label(&self) -> String {
+        match self.rate {
+            Some(rate) => format!("{:?}@{}", self.scenario, rate.name()),
+            None => format!("{:?}", self.scenario),
+        }
     }
 }
 
@@ -100,8 +137,7 @@ fn flag(name: &str) -> Option<String> {
 }
 
 struct Result {
-    scenario: Scenario,
-    retention: Option<bool>,
+    run: Run,
     cost: Cost,
     p50: f64,
     p95: f64,
@@ -111,13 +147,16 @@ struct Result {
 }
 
 pub struct AutoRun {
-    /// The scenarios to run, each with retention on or off, or neither
-    /// where GPUI has no retained views.
-    runs: Vec<(Scenario, Option<bool>)>,
+    runs: Vec<Run>,
     measured_frames: usize,
     index: usize,
     frame: usize,
     started: Option<Sample>,
+    /// When measuring started, for a run to last `MIN_TICKS` of its rate.
+    measuring_since: Option<Instant>,
+    /// Frames drawn by the last frame callback, to count only the time
+    /// between callbacks that drew a frame.
+    last_frames: Option<u64>,
     frame_cpu: Vec<f64>,
     last_cpu: Option<Duration>,
     frame_instructions: Vec<u64>,
@@ -128,10 +167,10 @@ pub struct AutoRun {
 }
 
 impl AutoRun {
-    /// Every scenario with retention on, then off; `--only <scenario>` and
-    /// `--retention on|off` narrow that down, and `--frames <n>` sets how
-    /// many frames each is measured over.
-    pub fn new() -> Self {
+    /// Every scenario with retention on, then off, the workspace's at each
+    /// of `rates`; `--only <scenario>` and `--retention on|off` narrow that
+    /// down, and `--frames <n>` sets how many frames each is measured over.
+    pub fn new(rates: Vec<Rate>) -> Self {
         let only = flag("--only").map(|only| only.to_lowercase());
         let retention = flag("--retention").map(|retention| retention.to_lowercase());
         let modes: &[Option<bool>] = if cfg!(feature = "upstream") {
@@ -139,6 +178,7 @@ impl AutoRun {
         } else {
             &[Some(true), Some(false)]
         };
+        let rates = &rates;
         let runs = modes
             .iter()
             .copied()
@@ -149,10 +189,25 @@ impl AutoRun {
                         .is_none_or(|retention| (retention == "on") == on)
                 })
             })
-            .flat_map(|on| SCENARIOS.map(|scenario| (scenario, on)))
-            .filter(|(scenario, _)| {
-                only.as_deref()
-                    .is_none_or(|only| format!("{scenario:?}").to_lowercase() == only)
+            .flat_map(|retention| {
+                SCENARIOS.into_iter().flat_map(move |scenario| {
+                    let rates: Vec<Option<Rate>> = if scenario.is_workspace() {
+                        rates.iter().copied().map(Some).collect()
+                    } else {
+                        vec![None]
+                    };
+                    rates.into_iter().map(move |rate| Run {
+                        scenario,
+                        retention,
+                        rate,
+                    })
+                })
+            })
+            .filter(|run| {
+                only.as_deref().is_none_or(|only| {
+                    format!("{:?}", run.scenario).to_lowercase() == only
+                        || run.label().to_lowercase() == only
+                })
             })
             .collect::<Vec<_>>();
         if runs.is_empty() {
@@ -166,6 +221,8 @@ impl AutoRun {
             index: 0,
             frame: 0,
             started: None,
+            measuring_since: None,
+            last_frames: None,
             frame_cpu: Vec::new(),
             last_cpu: None,
             frame_instructions: Vec::new(),
@@ -183,7 +240,7 @@ impl AutoRun {
         window: &mut Window,
         cx: &mut App,
     ) -> bool {
-        let Some(&(scenario, retention)) = self.runs.get(self.index) else {
+        let Some(&run) = self.runs.get(self.index) else {
             // The platform window holds the focused search box's input
             // handler until a frame is drawn without it, and on Wayland a
             // closed window's state, handler included, is only dropped by a
@@ -202,6 +259,11 @@ impl AutoRun {
             cx.quit();
             return false;
         };
+        let Run {
+            scenario,
+            retention,
+            rate,
+        } = run;
         if self.frame == 0 {
             if let Some(retention) = retention {
                 backend::set_view_retention(window, retention);
@@ -220,7 +282,7 @@ impl AutoRun {
             };
             driver.borrow_mut().scroll = scroll;
             let refresh = matches!(scenario, Scenario::RefreshTable);
-            let streaming = scenario.is_workspace();
+            let rate = rate.unwrap_or(Rate::Idle);
             handles
                 .showcase
                 .update(cx, |showcase, cx| {
@@ -230,16 +292,16 @@ impl AutoRun {
                     if showcase.container.read(cx).refreshing != refresh {
                         showcase.toggle_refresh(window, cx);
                     }
-                    // So does toggling the quote stream, the workspace.
-                    if showcase.container.read(cx).streaming != streaming {
-                        showcase.toggle_streaming(window, cx);
+                    // So does changing the quote rate, the workspace.
+                    if showcase.container.read(cx).rate != rate {
+                        showcase.set_quote_rate(rate, window, cx);
                     }
                     if let Some(workspace) = showcase.container.read(cx).workspace.clone() {
                         let quotes = match scenario {
                             Scenario::WorkspaceScroll | Scenario::WorkspaceHover => {
-                                QUOTES_PER_TICK / 2
+                                rate.quotes_per_tick() / 2
                             }
-                            _ => QUOTES_PER_TICK,
+                            _ => rate.quotes_per_tick(),
                         };
                         workspace.update(cx, |workspace, _| workspace.quotes_per_tick = quotes);
                     }
@@ -255,11 +317,16 @@ impl AutoRun {
 
         let cpu = main_thread_cpu_time();
         let instructions = main_thread_instructions();
+        let frames = backend::frames(window);
+        // Whether a frame was drawn since the last callback: the time since
+        // then is that frame's, and otherwise idle time, which is not a frame.
+        let drew = self.last_frames.is_some_and(|last| frames > last);
         if self.frame == WARMUP_FRAMES {
             self.started = Some(Sample::take(window));
+            self.measuring_since = Some(Instant::now());
             self.frame_cpu.clear();
             self.frame_instructions.clear();
-        } else if self.frame > WARMUP_FRAMES {
+        } else if self.frame > WARMUP_FRAMES && drew {
             if let Some(last) = self.last_cpu {
                 self.frame_cpu.push((cpu - last).as_secs_f64() * 1e3);
             }
@@ -269,9 +336,17 @@ impl AutoRun {
         }
         self.last_cpu = Some(cpu);
         self.last_instructions = instructions;
+        self.last_frames = Some(frames);
 
         self.frame += 1;
-        if self.frame > WARMUP_FRAMES + self.measured_frames {
+        let min_duration = rate
+            .and_then(Rate::every)
+            .map_or(Duration::ZERO, |every| every * MIN_TICKS);
+        if self.frame > WARMUP_FRAMES + self.measured_frames
+            && self
+                .measuring_since
+                .is_some_and(|since| since.elapsed() >= min_duration)
+        {
             let cost = Cost::between(self.started.as_ref().unwrap(), &Sample::take(window));
             let mut frame_cpu = std::mem::take(&mut self.frame_cpu);
             frame_cpu.sort_by(f64::total_cmp);
@@ -284,8 +359,7 @@ impl AutoRun {
             let mut frame_instructions = std::mem::take(&mut self.frame_instructions);
             frame_instructions.sort_unstable();
             self.results.push(Result {
-                scenario,
-                retention,
+                run,
                 cost,
                 p50: percentile(0.5),
                 p95: percentile(0.95),
@@ -297,6 +371,8 @@ impl AutoRun {
             self.frame = 0;
             self.last_cpu = None;
             self.last_instructions = None;
+            self.last_frames = None;
+            self.measuring_since = None;
         }
         true
     }
@@ -306,7 +382,7 @@ impl AutoRun {
             return;
         }
         println!(
-            "\n{:<16} {:>9} {:>6} {:>9} {:>9} {:>9} {:>7} {:>7} {:>8} {:>8} {:>9} {:>8} {:>8} {:>6} {:>6}",
+            "\n{:<22} {:>9} {:>6} {:>9} {:>9} {:>9} {:>7} {:>7} {:>7} {:>8} {:>8} {:>9} {:>8} {:>8} {:>6} {:>6}",
             "scenario",
             "retention",
             "fps",
@@ -314,6 +390,7 @@ impl AutoRun {
             "cpu p95",
             "instr p50",
             "proc",
+            "main",
             "p-cores",
             "memory",
             "build",
@@ -329,9 +406,9 @@ impl AutoRun {
             let cost = &result.cost;
             let phases = cost.phases;
             println!(
-                "{:<16} {:>9} {:>6.0} {:>7.2}ms {:>7.2}ms {:>9} {:>6.0}% {:>7} {:>8} {:>8} {:>9} {:>8} {:>8} {:>6} {:>6}",
-                format!("{:?}", result.scenario),
-                match result.retention {
+                "{:<22} {:>9} {:>6.0} {:>7.2}ms {:>7.2}ms {:>9} {:>6.0}% {:>6.0}% {:>7} {:>8} {:>8} {:>9} {:>8} {:>8} {:>6} {:>6}",
+                result.run.label(),
+                match result.run.retention {
                     Some(true) => "on",
                     Some(false) => "off",
                     None => "upstream",
@@ -343,6 +420,7 @@ impl AutoRun {
                     .instructions_p50
                     .map_or("-".to_string(), |n| format!("{:.1}M", n / 1e6)),
                 cost.process_cpu_percent,
+                cost.main_cpu_percent,
                 cost.performance_core_percent
                     .map_or("-".to_string(), |percent| format!("{percent:.0}%")),
                 cost.memory_mib
@@ -356,9 +434,11 @@ impl AutoRun {
             );
         }
         println!(
-            "\ncpu p50/p95: main thread CPU per frame. instr p50: main thread instructions per \
-             frame, which unlike CPU time do not depend on the core or the clock the thread got. \
-             proc: the whole process, render threads included. p-cores: the share of the \
+            "\nfps: frames drawn per second. cpu p50/p95: main thread CPU per frame drawn. \
+             instr p50: main thread instructions per frame drawn, which unlike CPU time do not \
+             depend on the core or the clock the thread got. proc, main: CPU used over the run, \
+             in % of one core, by the whole process, render threads included, and by its main \
+             thread. p-cores: the share of the \
              process's CPU time on performance cores. memory: the process's memory at the end, resident on Linux, its footprint on macOS. build, prepaint, paint: per frame; layout is Taffy's share of prepaint. \
              built, reused: views per frame. \"-\": not counted by upstream GPUI."
         );

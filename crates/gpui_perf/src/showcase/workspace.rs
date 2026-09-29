@@ -1,6 +1,7 @@
 //! The trading workspace page: a docked window of market panels built the way
 //! Longbridge Pro builds its main window on GPUI Kit, with a live stream of
-//! quotes that a timer pushes in.
+//! quotes that a timer pushes in, at one of the rates of `gpui_perf::rate`:
+//! from once a second to every frame.
 //!
 //! The component pages keep to one screen. A real application puts many of
 //! them in one window and wires them to a shared data feed, and most of what
@@ -36,7 +37,7 @@
 //! The same workspace, without a window, is the headless `workspace-*`
 //! scenarios in `scenarios/workspace.rs`.
 
-use std::{cell::Cell, ops::Range, rc::Rc, time::Duration};
+use std::{cell::Cell, ops::Range, rc::Rc};
 
 use gpui::{
     AnyView, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
@@ -44,6 +45,8 @@ use gpui::{
     StyleRefinement, Subscription, Task, UTF16Selection, UniformListScrollHandle, Window, canvas,
     div, fill, point, prelude::*, px, relative, rems, size, transparent_black, uniform_list,
 };
+
+use gpui_perf::rate::Rate;
 
 use super::theme::{Theme, theme};
 
@@ -63,14 +66,6 @@ const CANDLES: usize = 120;
 const QUOTES_PER_CANDLE: usize = 40;
 /// The symbol the quote panels show.
 const SELECTED: usize = 7;
-
-/// How often the stream pushes quotes: about sixty times a second, as a busy
-/// market's feed does.
-const STREAM_EVERY: Duration = Duration::from_millis(16);
-
-/// Quotes the stream pushes each time, unless an automatic run says
-/// otherwise.
-pub const QUOTES_PER_TICK: usize = 16;
 
 /// One quote as the feed delivers it.
 #[derive(Clone, Copy)]
@@ -331,7 +326,10 @@ pub struct Workspace {
     /// background tabs and closed docks do.
     _hidden: Vec<Entity<HiddenPanel>>,
     stream: Option<Task<()>>,
-    /// Quotes each tick of the stream pushes.
+    /// How often the stream pushes quotes, [`Rate::Idle`] while it doesn't.
+    pub rate: Rate,
+    /// Quotes each tick of the stream pushes: the rate's, unless an
+    /// automatic run says otherwise.
     pub quotes_per_tick: usize,
     ticks: usize,
 }
@@ -397,25 +395,26 @@ impl Workspace {
             watchlist,
             dock,
             stream: None,
-            quotes_per_tick: QUOTES_PER_TICK,
+            rate: Rate::Idle,
+            quotes_per_tick: 0,
             ticks: 0,
         }
     }
 
-    /// Starts or stops streaming quotes, returning whether it streams.
-    pub fn toggle_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.stream.take().is_some() {
-            return false;
-        }
-        self.stream = Some(cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor().timer(STREAM_EVERY).await;
-                if this.update(cx, |this, cx| this.tick(cx)).is_err() {
-                    break;
+    /// Streams quotes at `rate`, or stops streaming them at [`Rate::Idle`].
+    pub fn set_rate(&mut self, rate: Rate, window: &mut Window, cx: &mut Context<Self>) {
+        self.rate = rate;
+        self.quotes_per_tick = rate.quotes_per_tick();
+        self.stream = rate.every().map(|every| {
+            cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(every).await;
+                    if this.update(cx, |this, cx| this.tick(cx)).is_err() {
+                        break;
+                    }
                 }
-            }
-        }));
-        true
+            })
+        });
     }
 
     /// Pushes one tick's quotes: each updates the store, which notifies the

@@ -62,8 +62,9 @@ setting one up.
 
 - The toolbar picks what scrolls itself — `Off`, `Sidebar`, `Page`, `Table`
   (keys `1`–`4`) — and switches `Refresh data` (`R`), which updates table
-  rows every 33 ms, and `Retained views` (`V`). The arrow keys move through
-  the sidebar.
+  rows every 33 ms, and `Retained views` (`V`). `Quotes` sets how fast quotes
+  stream into the trading workspace — off, 1, 4, 15 or 60 Hz, the rate tiers
+  below — and `Q` steps to the next. The arrow keys move through the sidebar.
 - The status bar shows, every half second: frames per second, the CPU of the
   whole process and of the main thread, on macOS the share of that CPU time
   spent on performance cores, the process's memory (resident on Linux, its
@@ -78,7 +79,29 @@ what each cost per frame, and quits:
 ```sh
 cargo run -p gpui_perf --release -- --auto
 cargo run -p gpui_perf --release -- --auto --only ScrollPage --retention on --frames 1000
+cargo run -p gpui_perf --release -- --auto --rate all
+cargo run -p gpui_perf --release -- --auto --only WorkspaceQuotes --rate calm,normal
 ```
+
+`--rate` sets how fast quotes stream into the trading workspace, for its
+`Workspace*` scenarios, which are reported as `WorkspaceQuotes@normal` and so
+on:
+
+| tier     | ticks          | quotes a tick | as in                                |
+|----------|----------------|---------------|--------------------------------------|
+| `idle`   | never          | 0             | a closed market                      |
+| `calm`   | 1 Hz           | 8             | a quiet market, a watchlist at night |
+| `normal` | 4 Hz (250 ms)  | 32            | a feed batched every 250 ms          |
+| `busy`   | 15 Hz (66 ms)  | 24            | an active session                    |
+| `burst`  | 60 Hz (16 ms)  | 16            | the open, or news                    |
+
+`burst` is the default, the rate these scenarios had before there were tiers,
+so reports stay comparable; `all` runs every tier. At the slower rates most
+frames draw nothing: the per-frame columns count only frames drawn, `fps` is
+frames drawn per second, and `proc` and `main` give the CPU the process and
+its main thread used over the run. `idle` shows the floor, which includes the
+run asking for a frame at every vsync to step itself. Without `--auto`,
+`--rate` opens the workspace streaming at that rate.
 
 On macOS, `--auto` holds the CPU's clock up while it measures, with a helper
 process spinning on a performance core, as the performance governor does on
@@ -126,7 +149,14 @@ cargo run -p gpui_perf --release -- --headless
 cargo run -p gpui_perf --release -- --headless --scenario table --frames 200
 cargo run -p gpui_perf --release -- --headless --verify
 cargo run -p gpui_perf --release -- --headless --list
+cargo run -p gpui_perf --release -- --headless --scenario quotes
 ```
+
+`workspace-quotes-busy`, `-normal` and `-calm` (and their `workspace-quiet-`
+twins) tick the feed every 4th, 15th or 60th frame instead of every frame.
+Frames in between change nothing; they are not drawn, as a real window would
+not draw them, and not counted per frame, so `instructions M` is per drawn
+frame, and `instr M/s at 60 fps` counts every frame.
 
 ### Other benchmarks
 

@@ -11,6 +11,8 @@ use gpui::{
     point, prelude::*, px, uniform_list,
 };
 
+use gpui_perf::rate::Rate;
+
 use super::{
     app_state::app_state,
     controls::Tooltip,
@@ -41,8 +43,9 @@ pub struct Container {
     pub workspace: Option<Entity<Workspace>>,
     showing: PageKind,
     pub refreshing: bool,
-    /// Whether the workspace's quotes are streaming.
-    pub streaming: bool,
+    /// How fast the workspace's quotes stream, [`Rate::Idle`] while they
+    /// don't.
+    pub rate: Rate,
     /// The page's name, which the root view reads for its header, as GPUI
     /// Kit's gallery reads its stories'.
     pub title: SharedString,
@@ -59,7 +62,7 @@ impl Container {
             workspace: None,
             showing: PageKind::Components,
             refreshing: false,
-            streaming: false,
+            rate: Rate::Idle,
             title: SharedString::default(),
         }
     }
@@ -106,11 +109,12 @@ impl Container {
         }
     }
 
-    /// Starts or stops streaming the workspace's quotes.
-    pub fn toggle_streaming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Streams the workspace's quotes at `rate`, or stops them at
+    /// [`Rate::Idle`].
+    pub fn set_quote_rate(&mut self, rate: Rate, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(workspace) = &self.workspace {
-            self.streaming =
-                workspace.update(cx, |workspace, cx| workspace.toggle_stream(window, cx));
+            workspace.update(cx, |workspace, cx| workspace.set_rate(rate, window, cx));
+            self.rate = rate;
         }
     }
 }

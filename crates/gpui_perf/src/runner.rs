@@ -15,6 +15,11 @@
 //! task the step set off — is the frame. The step itself is timed separately
 //! and taken out. If a step leaves the window clean, so that nothing drew, the
 //! window is drawn explicitly and that draw counts instead (`forced_draws`).
+//! A scenario whose data changes only every few frames — the trading
+//! workspace's `-calm`, `-normal` and `-busy` quote rates — instead leaves such
+//! a frame undrawn, as a real window would (`skipped_frames`): its per-frame
+//! numbers are per drawn frame, and only the per-second total counts the
+//! frames in between.
 //!
 //! Times are per-thread CPU time (`CLOCK_THREAD_CPUTIME_ID`) where available,
 //! which doesn't count time the thread spent descheduled; wall time is kept
@@ -184,6 +189,13 @@ pub struct RunReport {
     pub allocated_kib: f64,
     /// Measured frames whose step left the window clean, drawn explicitly.
     pub forced_draws: usize,
+    /// Measured frames whose step left the window clean, left undrawn and
+    /// not counted in the per-frame numbers; see
+    /// [`Scenario::skips_clean_frames`].
+    pub skipped_frames: usize,
+    /// Main-thread instructions per second, in millions, over every measured
+    /// frame, drawn or not, as if they came at 60 a second.
+    pub instructions_per_second_m: Option<f64>,
 }
 
 /// Result of running both modes in lockstep and comparing what they painted.
@@ -398,6 +410,8 @@ struct FrameSample {
     instructions: Option<u64>,
     step: Duration,
     forced: bool,
+    /// Whether the step left the window clean and it was left undrawn.
+    skipped: bool,
     allocations: u64,
     allocated_bytes: u64,
 }
@@ -447,7 +461,9 @@ fn frame(
     cost = cost.saturating_sub(step);
     cost_wall = cost_wall.saturating_sub(step_wall);
 
-    let forced = draws_so_far(cx, window) == draws_before;
+    let clean = draws_so_far(cx, window) == draws_before;
+    let skipped = clean && scenario.skips_clean_frames();
+    let forced = clean && !skipped;
     if forced {
         let start = Stamp::now();
         cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
@@ -467,6 +483,7 @@ fn frame(
         instructions,
         step,
         forced,
+        skipped,
         allocations: (allocations_after.0 - allocations_before.0)
             .saturating_sub(step_allocations.0),
         allocated_bytes: (allocations_after.1 - allocations_before.1)
@@ -492,10 +509,19 @@ fn measure(index: usize, retention: bool, options: &Options) -> RunReport {
     let mut instructions = Some(Vec::with_capacity(options.frames));
     let mut steps = Vec::with_capacity(options.frames);
     let mut forced_draws = 0;
+    let mut skipped_frames = 0;
+    let mut all_instructions = Some(0);
     let mut allocation_count = 0;
     let mut allocated_bytes = 0;
     for n in 0..options.frames {
         let sample = frame(&mut cx, window, &*scenario, &root, options.warmup + n);
+        all_instructions = all_instructions
+            .zip(sample.instructions)
+            .map(|(all, count)| all + count);
+        if sample.skipped {
+            skipped_frames += 1;
+            continue;
+        }
         costs.push(sample.cost);
         costs_wall.push(sample.cost_wall);
         match (&mut instructions, sample.instructions) {
@@ -507,7 +533,8 @@ fn measure(index: usize, retention: bool, options: &Options) -> RunReport {
         allocation_count += sample.allocations;
         allocated_bytes += sample.allocated_bytes;
     }
-    let frames = options.frames.max(1) as f64;
+    let drawn = options.frames - skipped_frames;
+    let frames = drawn.max(1) as f64;
 
     let stats = cx
         .update_window(window, |_, window, _| window.layout_stats())
@@ -523,10 +550,13 @@ fn measure(index: usize, retention: bool, options: &Options) -> RunReport {
         instructions_m: instructions
             .map(|all| all.iter().sum::<u64>() as f64 / all.len().max(1) as f64 / 1e6),
         step: Summary::of(&steps),
-        phases: PhaseAverages::of(&stats, options.frames),
+        phases: PhaseAverages::of(&stats, drawn),
         allocations: allocation_count as f64 / frames,
         allocated_kib: allocated_bytes as f64 / 1024. / frames,
         forced_draws,
+        skipped_frames,
+        instructions_per_second_m: all_instructions
+            .map(|all| all as f64 / 1e6 / (options.frames.max(1) as f64 / 60.)),
     }
 }
 
@@ -667,13 +697,18 @@ pub fn format_reports(reports: &[ScenarioReport]) -> String {
         let _ = writeln!(out);
 
         type Row = (&'static str, fn(&RunReport) -> f64, usize);
-        let rows: [Row; 22] = [
+        let rows: [Row; 23] = [
             ("frame mean ms", |r| r.frame.mean_ms, 3),
             ("frame p50 ms", |r| r.frame.p50_ms, 3),
             ("frame p95 ms", |r| r.frame.p95_ms, 3),
             ("frame max ms", |r| r.frame.max_ms, 3),
             ("wall mean ms", |r| r.frame_wall.mean_ms, 3),
             ("instructions M", |r| r.instructions_m.unwrap_or(0.), 2),
+            (
+                "instr M/s at 60 fps",
+                |r| r.instructions_per_second_m.unwrap_or(0.),
+                1,
+            ),
             ("  build ms", |r| r.phases.build_ms, 3),
             ("  prepaint ms", |r| r.phases.prepaint_ms, 3),
             ("    layout ms", |r| r.phases.compute_layout_ms, 3),
@@ -702,6 +737,20 @@ pub fn format_reports(reports: &[ScenarioReport]) -> String {
             let _ = writeln!(out);
         }
         for run in &runs {
+            if run.skipped_frames > 0 {
+                let _ = writeln!(
+                    out,
+                    "  note: {} of {} frames had nothing to draw and were not drawn ({}); \
+                     the per-frame numbers are per drawn frame",
+                    run.skipped_frames,
+                    run.frames,
+                    if run.retention {
+                        "retained"
+                    } else {
+                        "from scratch"
+                    }
+                );
+            }
             if run.forced_draws > 0 {
                 let _ = writeln!(
                     out,

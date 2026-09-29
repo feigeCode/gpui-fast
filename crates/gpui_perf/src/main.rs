@@ -29,7 +29,13 @@
 //! - `--auto`: run every scenario with retention on and off, print what each
 //!   cost, and quit.
 //! - `--only <scenario>`, `--retention on|off`, `--frames N`: narrow `--auto`
-//!   down.
+//!   down. `--only` takes a name `--auto --list` prints, or one with its
+//!   rate, `WorkspaceQuotes@calm`.
+//! - `--rate <tier>[,<tier>…]|all`: how fast quotes stream into the trading
+//!   workspace — `idle`, `calm` (1 Hz), `normal` (4 Hz), `busy` (15 Hz) or
+//!   `burst` (60 Hz); see `rate.rs`. `--auto` runs its Workspace scenarios at
+//!   each (`burst` by default, the rate they had before there were tiers);
+//!   the showcase opens the workspace streaming at the one given.
 //! - `--no-hold-clock`: on macOS, measure `--auto` without holding the CPU's
 //!   clock up; see `showcase/clock.rs`.
 //!
@@ -70,7 +76,8 @@ use gpui_perf::runner::{self, Options, RetentionModes};
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-const USAGE: &str = "usage: gpui_perf [--demo | --auto [--only SCENARIO] [--retention on|off] [--frames N] [--no-hold-clock]]\n       \
+const USAGE: &str = "usage: gpui_perf [--demo] [--rate idle|calm|normal|busy|burst]\n       \
+gpui_perf --auto [--list] [--only SCENARIO[@RATE]] [--rate RATE[,RATE...]|all] [--retention on|off] [--frames N] [--no-hold-clock]\n       \
 gpui_perf --headless [--scenario SUBSTRING]... [--frames N] [--warmup N] \
 [--retention on|off|both] [--json PATH] [--verify] [--list]";
 

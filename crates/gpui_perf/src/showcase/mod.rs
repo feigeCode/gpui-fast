@@ -15,9 +15,10 @@
 //! search box, a text selection layer, and a market feed every panel
 //! subscribes to, which a timer streams quotes into; see `workspace.rs`.
 //!
-//! The toolbar picks what scrolls itself, and switches the data refresh and
-//! retained views. Every command has a key: `1`–`6` for what scrolls, `R` for
-//! the refresh, `Q` for the workspace's quote stream, `V` for retained views,
+//! The toolbar picks what scrolls itself and how fast the workspace's quotes
+//! stream — off, or one of the rates of `gpui_perf::rate` — and switches the
+//! data refresh and retained views. Every command has a key: `1`–`6` for what
+//! scrolls, `R` for the refresh, `Q` for the next quote rate, `V` for retained views,
 //! and the arrow keys to move through the sidebar. The status bar shows,
 //! every half second, the frame rate, the process's CPU and the main
 //! thread's, its resident memory, what build, prepaint, layout and paint took
@@ -26,8 +27,11 @@
 //! With `--auto`, it runs every scenario with retained views on and then off,
 //! prints what each cost per frame, and quits. `--only <scenario>`,
 //! `--retention on|off` and `--frames <n>` narrow it down, and `--list` prints
-//! the scenarios instead. On macOS it holds the CPU's clock up while it
-//! measures; see `clock.rs`.
+//! the scenarios instead. `--rate <tier>` sets how fast the workspace's
+//! quotes stream: in `--auto`, one or more tiers, or `all`, to run the
+//! workspace's scenarios at each (`burst`, today's 60 Hz, by default); in the
+//! showcase, the rate it opens the workspace streaming at. On macOS it holds
+//! the CPU's clock up while it measures; see `clock.rs`.
 //!
 //! Built with the `upstream` feature it runs on upstream GPUI, the
 //! `gpui-pre` snapshot GPUI Kit pins, for comparison; see `backend.rs`.
@@ -56,6 +60,7 @@ use gpui::{
     KeyBinding, Pixels, Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window,
     WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
+use gpui_perf::rate::Rate;
 use gpui_platform::application;
 
 use app_state::{AppState, SharedAppState, app_state};
@@ -75,7 +80,7 @@ actions!(
         ScrollList,
         ScrollWatchlist,
         ToggleRefresh,
-        ToggleStreaming,
+        NextQuoteRate,
         ToggleRetention,
         SelectNext,
         SelectPrevious,
@@ -226,7 +231,6 @@ pub enum Scroll {
     Watchlist,
 }
 
-/// Opens the showcase, running every scenario and quitting if `auto`.
 /// How long `--demo` scrolls each thing.
 const DEMO_STEP: Duration = Duration::from_secs(6);
 
@@ -239,6 +243,16 @@ pub fn run(auto: bool, demo: bool) {
         auto::list();
         return;
     }
+    let rates = rate_flag();
+    let rate = match rates.as_deref() {
+        _ if auto => None,
+        None => None,
+        Some([rate]) => Some(*rate),
+        Some(_) => {
+            eprintln!("the showcase takes one --rate; --auto takes several");
+            std::process::exit(2);
+        }
+    };
     application().run(move |cx: &mut App| {
         if !example_support::load_fonts(cx) {
             return;
@@ -251,7 +265,7 @@ pub fn run(auto: bool, demo: bool) {
             KeyBinding::new("5", ScrollList, Some(KEY_CONTEXT)),
             KeyBinding::new("6", ScrollWatchlist, Some(KEY_CONTEXT)),
             KeyBinding::new("r", ToggleRefresh, Some(KEY_CONTEXT)),
-            KeyBinding::new("q", ToggleStreaming, Some(KEY_CONTEXT)),
+            KeyBinding::new("q", NextQuoteRate, Some(KEY_CONTEXT)),
             KeyBinding::new("v", ToggleRetention, Some(KEY_CONTEXT)),
             KeyBinding::new("down", SelectNext, Some(KEY_CONTEXT)),
             KeyBinding::new("up", SelectPrevious, Some(KEY_CONTEXT)),
@@ -274,7 +288,7 @@ pub fn run(auto: bool, demo: bool) {
             },
             |window, cx| {
                 Theme::follow(window, cx);
-                cx.new(|cx| Showcase::new(auto, demo, window, cx))
+                cx.new(|cx| Showcase::new(auto, demo, rate, window, cx))
             },
         )
         .unwrap();
@@ -441,7 +455,13 @@ fn step(
 }
 
 impl Showcase {
-    fn new(auto: bool, demo: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        auto: bool,
+        demo: bool,
+        rate: Option<Rate>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let container = cx.new(|cx| {
             let mut container = Container::new(BUTTON_PAGE, cx);
             container.title = page_name(BUTTON_PAGE).into();
@@ -514,7 +534,7 @@ impl Showcase {
             driver: Rc::new(RefCell::new(Driver {
                 scroll: Scroll::Off,
                 direction: 1.,
-                auto: auto.then(AutoRun::new),
+                auto: auto.then(|| AutoRun::new(rate_flag().unwrap_or(vec![Rate::Burst]))),
                 demo: demo.then(Instant::now),
                 running: false,
             })),
@@ -522,6 +542,9 @@ impl Showcase {
         };
         if auto || demo {
             this.start_frames(window, cx);
+        }
+        if let Some(rate) = rate {
+            this.set_quote_rate(rate, window, cx);
         }
         this
     }
@@ -569,15 +592,24 @@ impl Showcase {
         cx.notify();
     }
 
-    /// Starts or stops the workspace's quote stream, showing the workspace.
-    fn toggle_streaming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Streams the workspace's quotes at `rate`, or stops them at
+    /// [`Rate::Idle`], showing the workspace.
+    fn set_quote_rate(&mut self, rate: Rate, window: &mut Window, cx: &mut Context<Self>) {
         if self.active != workspace_page() {
             self.select(workspace_page(), cx);
         }
-        self.container
-            .update(cx, |container, cx| container.toggle_streaming(window, cx));
+        self.container.update(cx, |container, cx| {
+            container.set_quote_rate(rate, window, cx)
+        });
         self.focus_page(window, cx);
         cx.notify();
+    }
+
+    /// Streams the workspace's quotes at the next rate, from off up to
+    /// `burst` and back to off.
+    fn next_quote_rate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next = next_rate(self.container.read(cx).rate);
+        self.set_quote_rate(next, window, cx);
     }
 
     /// Focuses the workspace's search box while the workspace is shown, as a
@@ -629,7 +661,7 @@ impl Showcase {
             (theme.border, build, theme.build_foreground)
         };
         let refreshing = self.container.read(cx).refreshing;
-        let streaming = self.container.read(cx).streaming;
+        let quote_rate = self.container.read(cx).rate;
         let retention = backend::view_retention(window);
         let scroll_option = |scroll: Scroll,
                              label: &'static str,
@@ -715,12 +747,43 @@ impl Showcase {
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_refresh(window, cx))),
             )
             .child(
-                switch("streaming", "Stream quotes", streaming, cx)
+                segmented("Quotes", cx).child(segment_track(cx).children(Rate::ALL.map(|rate| {
+                    let (label, tip) = match rate {
+                        Rate::Idle => ("Off", "Stop streaming quotes".to_string()),
+                        Rate::Calm => (
+                            "1 Hz",
+                            format!("Stream {}: a calm market", rate.description()),
+                        ),
+                        Rate::Normal => (
+                            "4 Hz",
+                            format!("Stream {}: a feed batched every 250 ms", rate.description()),
+                        ),
+                        Rate::Busy => (
+                            "15 Hz",
+                            format!("Stream {}: a busy session", rate.description()),
+                        ),
+                        Rate::Burst => (
+                            "60 Hz",
+                            format!("Stream {}: a burst, every frame", rate.description()),
+                        ),
+                    };
+                    segment(
+                        SharedString::from(format!("rate-{}", rate.name())),
+                        label,
+                        quote_rate == rate,
+                        cx,
+                    )
+                    // `Q` steps to the next rate.
                     .tooltip(Tooltip::text(
-                        "Stream 16 quotes into the trading workspace 60 times a second",
-                        Some("Q"),
+                        tip,
+                        (next_rate(quote_rate) == rate).then_some("Q"),
                     ))
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_streaming(window, cx))),
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.set_quote_rate(rate, window, cx)
+                        }),
+                    )
+                }))),
             )
             // Upstream GPUI has no retained views to switch.
             .when_some(retention, |this, retention| {
@@ -838,6 +901,38 @@ impl Showcase {
     }
 }
 
+/// The quote rate after `rate`, from off up to `burst` and back to off.
+fn next_rate(rate: Rate) -> Rate {
+    let index = Rate::ALL.iter().position(|r| *r == rate).unwrap_or(0);
+    Rate::ALL[(index + 1) % Rate::ALL.len()]
+}
+
+/// `--rate`: one or more quote rates, comma-separated or repeated, or `all`.
+/// Exits if one is not a rate.
+fn rate_flag() -> Option<Vec<Rate>> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut rates = Vec::new();
+    for pair in args.windows(2).filter(|pair| pair[0] == "--rate") {
+        for name in pair[1].split(',') {
+            if name.eq_ignore_ascii_case("all") {
+                rates.extend(Rate::ALL);
+                continue;
+            }
+            let Some(rate) = Rate::parse(name) else {
+                let names: Vec<&str> = Rate::ALL.iter().map(|rate| rate.name()).collect();
+                eprintln!("--rate takes {} or all, got {name:?}", names.join(", "));
+                std::process::exit(2);
+            };
+            rates.push(rate);
+        }
+    }
+    let rates: Vec<Rate> = Rate::ALL
+        .into_iter()
+        .filter(|rate| rates.contains(rate))
+        .collect();
+    (!rates.is_empty()).then_some(rates)
+}
+
 /// A spinner, animating every frame as a loading indicator does. The
 /// animation asks for each frame by notifying the view it is drawn in.
 fn spinner(cx: &App) -> impl IntoElement {
@@ -895,9 +990,9 @@ impl Render for Showcase {
             .on_action(
                 cx.listener(|this, _: &ToggleRefresh, window, cx| this.toggle_refresh(window, cx)),
             )
-            .on_action(cx.listener(|this, _: &ToggleStreaming, window, cx| {
-                this.toggle_streaming(window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &NextQuoteRate, window, cx| this.next_quote_rate(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &ToggleRetention, window, cx| {
                 this.toggle_retention(window, cx)
             }))

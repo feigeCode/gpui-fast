@@ -15,6 +15,7 @@ extern crate gpui_fast as gpui;
 
 pub mod alloc;
 pub mod instructions;
+pub mod rate;
 #[cfg(feature = "fast")]
 pub mod runner;
 #[cfg(feature = "fast")]
@@ -44,6 +45,15 @@ pub trait Scenario {
     /// Changes what frame `frame` changes. `root` is the view `build`
     /// returned.
     fn step(&self, root: &AnyView, frame: usize, window: &mut Window, cx: &mut App);
+
+    /// Whether a frame whose step leaves the window clean is left undrawn, as
+    /// a real window leaves it, and measured only in the totals, rather than
+    /// drawn explicitly and measured as a frame. Scenarios whose data changes
+    /// only every few frames say yes, so that their per-frame numbers are
+    /// per drawn frame.
+    fn skips_clean_frames(&self) -> bool {
+        false
+    }
 }
 
 /// Every scenario, in the order they are reported.
