@@ -1168,6 +1168,8 @@ pub(crate) fn finish_deferred(
 /// becomes the rendered frame.
 #[inline]
 pub(crate) fn finish_retained_frame(window: &mut Window) {
+    // The sprite atlas may be cleared when the frame is presented.
+    window.fast_glyph_bounds.finish_frame();
     window.retained_state.prebuilt.clear();
     window.retained_state.dirty_subtrees =
         mem::take(&mut window.retained_state.subtrees_dirty_next_frame);

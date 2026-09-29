@@ -239,6 +239,63 @@ fn text_measured_again_after_a_recolor_is_shaped_in_the_new_color() {
     );
 }
 
+/// Unchanged text leaves its node the closure and inputs of the element that
+/// measured it first. Measured again, because it was offered another width,
+/// it has to be measured into the layout of the element drawn now, which is
+/// the one painted and asked for positions.
+#[test]
+fn text_kept_as_it_was_and_measured_again_lands_in_the_new_elements_layout() {
+    let mut cx = TestAppContext::single();
+    let window = probed(&mut cx, 1000., false);
+    draw(&mut cx, window.into());
+    for _ in 0..3 {
+        let stats = change_probed(&mut cx, window, |_| {});
+        assert!(
+            stats.measurements_kept > 0 && stats.lines_shaped == 0,
+            "unchanged text should keep its measurement: {stats:?}"
+        );
+        let (lines, _) = probed_lines(&mut cx, window);
+        assert_eq!(lines, vec![PROBED_TEXT.to_string()]);
+    }
+
+    change_probed(&mut cx, window, |view| view.width = px(60.));
+    let (narrow, _) = probed_lines(&mut cx, window);
+    assert!(
+        narrow.len() == 1 && narrow[0] == PROBED_TEXT,
+        "one line of text, wrapped: {narrow:?}"
+    );
+    let wraps: usize = window
+        .update(&mut cx, |view, _, _| {
+            let layout = view.layout.borrow().clone().unwrap();
+            let inner = layout.0.borrow();
+            let inner = inner.as_ref().unwrap();
+            assert!(inner.size.unwrap().width <= px(60.));
+            inner
+                .lines
+                .iter()
+                .map(|line| line.wrap_boundaries.len())
+                .sum()
+        })
+        .unwrap();
+    assert!(wraps > 0, "the narrow box should wrap the text");
+
+    change_probed(&mut cx, window, |view| view.width = px(1000.));
+    let wraps: usize = window
+        .update(&mut cx, |view, _, _| {
+            let layout = view.layout.borrow().clone().unwrap();
+            let inner = layout.0.borrow();
+            inner
+                .as_ref()
+                .unwrap()
+                .lines
+                .iter()
+                .map(|line| line.wrap_boundaries.len())
+                .sum()
+        })
+        .unwrap();
+    assert_eq!(wraps, 0, "the wide box should not wrap the text");
+}
+
 /// Only truncating text takes a line wrapper, so the one path that does has
 /// to go on truncating: cut short with an ellipsis in a box too narrow for
 /// it, and whole again once the box is wide enough.

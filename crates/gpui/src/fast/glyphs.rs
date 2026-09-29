@@ -1,9 +1,10 @@
 //! Glyph painting that works out a run's rendering once, not once a glyph.
 
 use crate::{
-    Bounds, ContentMask, DecorationRun, DevicePixels, FontId, GlyphId, Hsla, IsZero,
-    MonochromeSprite, Pixels, Point, RenderGlyphParams, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, SubpixelSprite, TransformationMatrix, Window, util::round_half_toward_zero,
+    App, AtlasTile, Bounds, ContentMask, DecorationRun, DevicePixels, FontId, GlyphId, Hsla,
+    IsZero, MonochromeSprite, Pixels, Point, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, SubpixelSprite, TransformationMatrix, Window,
+    util::round_half_toward_zero,
 };
 use anyhow::Result;
 use std::borrow::Cow;
@@ -78,22 +79,29 @@ impl Window {
             dilation,
         };
 
-        let raster_bounds = match self.fast_glyph_bounds.get(&params) {
-            Some(raster_bounds) => raster_bounds,
+        let (raster_bounds, tile) = match self.fast_glyph_bounds.lookup(&params) {
+            Some(kept) => kept,
             None => {
                 let raster_bounds = self.text_system().raster_bounds(&params)?;
                 self.fast_glyph_bounds.insert(&params, raster_bounds);
-                raster_bounds
+                (raster_bounds, None)
             }
         };
         if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(&params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
+            let tile = match tile {
+                Some(tile) => tile,
+                None => {
+                    let tile = self
+                        .sprite_atlas
+                        .get_or_insert_with(&params.clone().into(), &mut || {
+                            let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                            Ok(Some((size, Cow::Owned(bytes))))
+                        })?
+                        .expect("Callback above only errors or returns Some");
+                    self.fast_glyph_bounds.insert_tile(&params, tile);
+                    tile
+                }
+            };
             let bounds = Bounds {
                 origin: integer_origin + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
@@ -176,9 +184,9 @@ impl LineGlyphPainter {
     }
 }
 
-/// How many glyphs' raster bounds a window keeps at hand. See
-/// [`GlyphBoundsCache`].
-const GLYPH_BOUNDS_SLOTS: usize = 512;
+/// How many glyphs' raster bounds a window keeps at hand, as a power of two.
+/// See [`GlyphBoundsCache`].
+const GLYPH_BOUNDS_SLOT_BITS: u32 = 12;
 
 /// The raster bounds of the glyphs a window painted lately, so painting a
 /// glyph needn't ask the text system, which locks its map of every glyph's
@@ -186,42 +194,146 @@ const GLYPH_BOUNDS_SLOTS: usize = 512;
 /// glyph's raster bounds only depend on that description, so the answer is
 /// the text system's own. Each glyph has one slot it can be kept in; a glyph
 /// that needs a slot another holds takes it over.
+///
+/// A glyph's slot also keeps where the glyph is in the window's sprite atlas,
+/// for the rest of the frame it was looked up in: the same digits are painted
+/// in hundreds of places a frame, and each lookup locks the atlas and hashes
+/// the glyph's description again. A tile is only kept for the frame, since
+/// the atlas may be cleared when the frame is presented (after a run of GPU
+/// errors, or when the device is lost), but glyphs are never removed from it
+/// while a frame is painted.
+///
+/// The bounding boxes of the fonts lines were painted in lately, at the sizes
+/// they were painted at, are kept here too. See [`bounding_box`].
 pub(crate) struct GlyphBoundsCache {
-    slots: Box<[Option<(RenderGlyphParams, Bounds<DevicePixels>)>]>,
+    slots: Box<[Option<GlyphSlot>]>,
+    /// Counts the frames the window finished painting, telling a tile looked
+    /// up in this one from one looked up before.
+    frame: u64,
+    bounding_boxes: Vec<(FontId, Pixels, Bounds<Pixels>)>,
+}
+
+/// What [`GlyphBoundsCache`] keeps of a glyph.
+#[derive(Clone)]
+struct GlyphSlot {
+    params: RenderGlyphParams,
+    raster_bounds: Bounds<DevicePixels>,
+    /// The glyph's tile, and the frame it was looked up in.
+    tile: Option<(u64, AtlasTile)>,
 }
 
 impl Default for GlyphBoundsCache {
     fn default() -> Self {
         Self {
-            slots: vec![None; GLYPH_BOUNDS_SLOTS].into_boxed_slice(),
+            slots: vec![None; 1 << GLYPH_BOUNDS_SLOT_BITS].into_boxed_slice(),
+            frame: 0,
+            bounding_boxes: Vec::new(),
         }
     }
 }
 
 impl GlyphBoundsCache {
+    /// The slot a glyph is kept in, from everything that tells apart the
+    /// glyphs a window paints: the same digit in two sizes, or in two colors
+    /// dilated differently, or at another subpixel offset, would otherwise
+    /// keep taking each other's slot.
     fn slot(params: &RenderGlyphParams) -> usize {
-        let key = (params.glyph_id.0 as usize)
-            .wrapping_mul(31)
-            .wrapping_add(params.font_id.0.wrapping_mul(0x9e37))
-            .wrapping_add((params.subpixel_variant.x as usize) << 3)
-            .wrapping_add((params.subpixel_variant.y as usize) << 5);
-        key % GLYPH_BOUNDS_SLOTS
+        const K: u64 = 0x9e37_79b9_7f4a_7c15;
+        let words = [
+            params.glyph_id.0 as u64 | (params.font_id.0 as u64) << 32,
+            params.font_size.0.to_bits() as u64
+                | (params.subpixel_variant.x as u64) << 32
+                | (params.subpixel_variant.y as u64) << 40
+                | (params.dilation as u64) << 48
+                | (params.subpixel_rendering as u64) << 56
+                | (params.is_emoji as u64) << 57,
+            params.scale_factor.to_bits() as u64,
+        ];
+        let hash = words.iter().fold(0u64, |hash, word| {
+            (hash.rotate_left(26) ^ word).wrapping_mul(K)
+        });
+        (hash >> (64 - GLYPH_BOUNDS_SLOT_BITS)) as usize
     }
 
+    /// The glyph's raster bounds, if kept.
+    #[cfg(test)]
     pub(crate) fn get(&self, params: &RenderGlyphParams) -> Option<Bounds<DevicePixels>> {
+        self.lookup(params).map(|(bounds, _)| bounds)
+    }
+
+    /// The glyph's raster bounds, if kept, and its tile, if it was looked up
+    /// this frame.
+    pub(crate) fn lookup(
+        &self,
+        params: &RenderGlyphParams,
+    ) -> Option<(Bounds<DevicePixels>, Option<AtlasTile>)> {
         match &self.slots[Self::slot(params)] {
-            Some((cached, bounds)) if cached == params => Some(*bounds),
+            Some(slot) if slot.params == *params => Some((
+                slot.raster_bounds,
+                slot.tile
+                    .and_then(|(frame, tile)| (frame == self.frame).then_some(tile)),
+            )),
             _ => None,
         }
     }
 
     pub(crate) fn insert(&mut self, params: &RenderGlyphParams, bounds: Bounds<DevicePixels>) {
-        self.slots[Self::slot(params)] = Some((params.clone(), bounds));
+        self.slots[Self::slot(params)] = Some(GlyphSlot {
+            params: params.clone(),
+            raster_bounds: bounds,
+            tile: None,
+        });
+    }
+
+    /// Keeps the tile the glyph was found at in the sprite atlas this frame,
+    /// if the glyph is kept.
+    pub(crate) fn insert_tile(&mut self, params: &RenderGlyphParams, tile: AtlasTile) {
+        if let Some(slot) = &mut self.slots[Self::slot(params)]
+            && slot.params == *params
+        {
+            slot.tile = Some((self.frame, tile));
+        }
+    }
+
+    /// Ends the frame the tiles kept were looked up in.
+    pub(crate) fn finish_frame(&mut self) {
+        self.frame += 1;
     }
 }
 
+/// How many fonts' bounding boxes [`bounding_box`] keeps, most recent last.
+const BOUNDING_BOXES: usize = 16;
+
+/// [`TextSystem::bounding_box`](crate::TextSystem::bounding_box), which
+/// painting a line asks for once a run: it takes a lock and hashes the font to
+/// find its metrics, where a window paints its text in a handful of fonts and
+/// sizes, whose bounding boxes it keeps.
+#[inline]
+pub(crate) fn bounding_box(
+    window: &mut Window,
+    cx: &App,
+    font_id: FontId,
+    font_size: Pixels,
+) -> Bounds<Pixels> {
+    let boxes = &mut window.fast_glyph_bounds.bounding_boxes;
+    if let Some((_, _, bounds)) = boxes
+        .iter()
+        .rev()
+        .find(|(id, size, _)| *id == font_id && *size == font_size)
+    {
+        return *bounds;
+    }
+    let bounds = cx.text_system().bounding_box(font_id, font_size);
+    if boxes.len() == BOUNDING_BOXES {
+        boxes.remove(0);
+    }
+    boxes.push((font_id, font_size, bounds));
+    bounds
+}
+
 /// Whether none of a line's decoration runs has a background, so painting its
-/// background paints nothing and needn't walk its glyphs.
+/// background paints nothing: it needn't walk its glyphs, nor push a layer to
+/// paint nothing in, which costs the scene a bounds tree insertion a line.
 #[inline]
 pub(crate) fn has_no_background(decoration_runs: &[DecorationRun]) -> bool {
     decoration_runs

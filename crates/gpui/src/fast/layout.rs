@@ -66,6 +66,9 @@ pub(crate) struct LayoutRetention {
     /// state the element made afresh, though it is expected to come out as
     /// before. See [`TaffyLayoutEngine::remeasures`].
     remeasures: u64,
+    /// The [`layout_fingerprint`] of the default style, which every text leaf
+    /// asks for, under the rem size and scale factor it was taken at.
+    default_fingerprint: Option<(Pixels, f32, u64)>,
 }
 
 /// Removes a node from the tree, and with it what its measurement captured.
@@ -214,6 +217,21 @@ impl MeasureLog {
             size
         })
     }
+}
+
+/// What an element made of the measurement the node it lays out was left
+/// with. See [`TaffyLayoutEngine::request_retained_carried_measured_layout`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Adopted {
+    /// The measurement does not stand for this element.
+    No,
+    /// The element took the measurement over, and measures the node from now
+    /// on: it differs from the element before it in something measuring it
+    /// again would use.
+    Measurement,
+    /// The element took the measurement over, and the node's closure measures
+    /// it as its own would: the node is left as it is.
+    Node,
 }
 
 /// What [`TaffyLayoutEngine::claim`] found for an element's key.
@@ -508,11 +526,14 @@ impl TaffyLayoutEngine {
     /// take over the measurement of the node retained under `key`, rather
     /// than have it taken again.
     ///
-    /// The element measuring the node last frame left `memo` there; `adopt` is
-    /// given it and takes the measurement over if it still stands, in which
-    /// case the node is given the new closure without being dirtied, and keeps
-    /// what Taffy cached for it and the nodes above it. Either way this
-    /// element's `memo` is left for the next frame's.
+    /// The element measuring the node last frame left what it measured from,
+    /// `state`, there; `adopt` is given this element's and that one, and takes
+    /// the measurement over if it still stands, in which case the node is not
+    /// dirtied, and keeps what Taffy cached for it and the nodes above it.
+    /// When `adopt` finds the node's measurement stands as it is, the node
+    /// keeps its closure and state too, and this element's `state` is dropped;
+    /// otherwise the node is given this element's, to measure it from and to
+    /// leave for the next frame's.
     ///
     /// When the measurement does not stand — a text element whose text
     /// changed — the node is still left clean if `measure` gives every size
@@ -522,15 +543,15 @@ impl TaffyLayoutEngine {
     /// ticks in a cell keeps its width, and the row, the list and the window
     /// around it are not laid out again. See [`MeasureLog`].
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn request_retained_carried_measured_layout(
+    pub(crate) fn request_retained_carried_measured_layout<S: 'static>(
         &mut self,
         key: Option<u64>,
-        style: &Style,
         rem_size: Pixels,
         scale_factor: f32,
-        memo: Rc<dyn Any>,
-        adopt: impl FnOnce(&dyn Any) -> bool,
-        mut measure: impl FnMut(
+        state: S,
+        adopt: impl FnOnce(&S, &dyn Any) -> Adopted,
+        measure: impl Fn(
+            &S,
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
             &mut Window,
@@ -540,21 +561,41 @@ impl TaffyLayoutEngine {
         window: &mut Window,
         cx: &mut App,
     ) -> LayoutId {
+        // The leaf is laid out in the default style, whose fingerprint only
+        // changes with the rem size and the scale factor.
+        let style_fingerprint = match self.retention.default_fingerprint {
+            Some((rem, scale, fingerprint)) if rem == rem_size && scale == scale_factor => {
+                fingerprint
+            }
+            _ => {
+                let fingerprint = layout_fingerprint(&Style::default(), rem_size, scale_factor);
+                self.retention.default_fingerprint = Some((rem_size, scale_factor, fingerprint));
+                fingerprint
+            }
+        };
         let frame = self.retention.frame;
         let reusable = key
             .and_then(|key| self.retention.retained.get(&key))
             .filter(|node| {
                 node.claimed_in_frame != frame
                     && node.measured
-                    && node.style_fingerprint == layout_fingerprint(style, rem_size, scale_factor)
+                    && node.style_fingerprint == style_fingerprint
             })
             .map(|node| (node.measurement.clone(), node.measure_log.clone()));
         if let Some((previous, log)) = reusable {
-            let kept = if previous.is_some_and(|previous| adopt(&*previous)) {
+            let adopted = previous.map_or(Adopted::No, |previous| adopt(&state, &*previous));
+            let kept = if adopted != Adopted::No {
                 self.retention.stats.measurements_kept += 1;
                 true
             } else if let Some(log) = &log
-                && log.replays(&mut measure, &mut self.retention.stats, window, cx)
+                && log.replays(
+                    &mut |known, available, window: &mut Window, cx: &mut App| {
+                        measure(&state, known, available, window, cx)
+                    },
+                    &mut self.retention.stats,
+                    window,
+                    cx,
+                )
             {
                 self.retention.stats.measurements_replayed += 1;
                 true
@@ -565,8 +606,15 @@ impl TaffyLayoutEngine {
                 && let Claim::Reused(key, id) = self.claim(key)
                 && let Some(context) = self.taffy.get_node_context_mut(id.into())
             {
+                if adopted == Adopted::Node {
+                    return id;
+                }
+                let state = Rc::new(state);
+                let memo: Rc<dyn Any> = state.clone();
                 let log = log.unwrap_or_default();
-                let measure = MeasureLog::logged(&log, measure);
+                let measure = MeasureLog::logged(&log, move |known, available, window, cx| {
+                    measure(&state, known, available, window, cx)
+                });
                 #[cfg(feature = "stacker")]
                 let measure = crate::taffy::StackSafe::new(measure);
                 context.measure = measure;
@@ -581,10 +629,21 @@ impl TaffyLayoutEngine {
             }
         }
 
+        let state = Rc::new(state);
+        let memo: Rc<dyn Any> = state.clone();
+        let measure = move |known, available, window: &mut Window, cx: &mut App| {
+            measure(&state, known, available, window, cx)
+        };
         let log = Rc::<MeasureLog>::default();
         let measure = MeasureLog::logged(&log, measure);
-        let id =
-            request_retained_measured_layout(self, key, style, rem_size, scale_factor, measure);
+        let id = request_retained_measured_layout(
+            self,
+            key,
+            &Style::default(),
+            rem_size,
+            scale_factor,
+            measure,
+        );
         if let Some(node) = key.and_then(|key| self.retention.retained.get_mut(&key))
             && node.id == id
         {

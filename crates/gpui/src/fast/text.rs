@@ -1,10 +1,11 @@
 //! Where a reused range of shaped lines falls in a new frame, text measurements
 //! carried from one frame to the next, and shaping statistics.
 
+use crate::fast::layout::Adopted;
 use crate::{
     App, AvailableSpace, DecorationRun, FontRun, FrameCache, Hsla, LayoutId, LineLayout,
     LineLayoutCache, LineLayoutIndex, Pixels, PlatformTextSystem, SharedString, Size,
-    StrikethroughStyle, Style, TextLayout, TextLayoutInner, TextOverflow, TextRun, TextStyle,
+    StrikethroughStyle, TextLayout, TextLayoutInner, TextOverflow, TextRun, TextStyle,
     TruncateFrom, UnderlineStyle, WhiteSpace, Window, WindowTextSystem, WrappedLine,
 };
 use collections::{FxHashMap, FxHasher};
@@ -15,6 +16,7 @@ use smallvec::SmallVec;
 use std::{
     any::Any,
     borrow::Cow,
+    cell::RefCell,
     cmp,
     hash::{Hash, Hasher},
     mem,
@@ -31,12 +33,18 @@ use std::{
 /// at the same place compares its own against them.
 pub(crate) struct TextMeasureInputs {
     text: SharedString,
-    /// Plain text is one run, kept inline.
-    runs: SmallVec<[TextRun; 1]>,
-    text_style: TextStyle,
+    /// The runs the element was given, or none for plain text, which is one
+    /// run in the text style: that run is only made when the text has to be
+    /// shaped, rather than copying the style's font into every element.
+    runs: Vec<TextRun>,
+    /// The text style in effect, shared with the window's text style stack
+    /// and every other element under the same refinements.
+    text_style: Rc<TextStyle>,
     font_size: Pixels,
     line_height: Pixels,
-    layout: TextLayout,
+    /// The layout of the element whose inputs these are, or of a later one
+    /// that took the measurement over while leaving the node with these.
+    layout: RefCell<TextLayout>,
 }
 
 /// The decorations of a run: what it is painted with, and what shaping splits
@@ -57,6 +65,33 @@ fn decoration_of(
     )
 }
 
+/// The decorations of plain text in `style`, as [`decoration_of`] its run.
+fn style_decoration(
+    style: &TextStyle,
+) -> (
+    Hsla,
+    Option<Hsla>,
+    Option<UnderlineStyle>,
+    Option<StrikethroughStyle>,
+) {
+    (
+        style.color,
+        style.background_color,
+        style.underline,
+        style.strikethrough,
+    )
+}
+
+/// Whether two text styles have the same font: `style.font() ==
+/// other.font()`, without making either font.
+fn same_font(style: &TextStyle, other: &TextStyle) -> bool {
+    style.font_family == other.font_family
+        && style.font_features == other.font_features
+        && style.font_fallbacks == other.font_fallbacks
+        && style.font_weight == other.font_weight
+        && style.font_style == other.font_style
+}
+
 impl TextMeasureInputs {
     /// Whether text truncates, in which case it is shaped from a rewritten
     /// string whose runs no longer line up with these.
@@ -64,13 +99,27 @@ impl TextMeasureInputs {
         self.text_style.text_overflow.is_some()
     }
 
+    /// Whether this is plain text: one run in the text style.
+    fn plain(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// The runs the text is shaped and painted with.
+    fn runs(&self) -> Cow<'_, [TextRun]> {
+        if self.plain() {
+            Cow::Owned(vec![self.text_style.to_run(self.text.len())])
+        } else {
+            Cow::Borrowed(&self.runs)
+        }
+    }
+
     /// Whether `self` is shaped as `other` is: the same text, sizes, fonts and
     /// wrapping, and decoration changing in the same places, since shaping
     /// splits font runs wherever it changes. What it is painted with may
     /// differ; see [`Self::decorated_as`].
     fn shapes_as(&self, other: &Self) -> bool {
-        fn runs(inputs: &TextMeasureInputs) -> impl Iterator<Item = &TextRun> {
-            inputs.runs.iter().filter(|run| run.len > 0)
+        fn runs(runs: &[TextRun]) -> impl Iterator<Item = &TextRun> {
+            runs.iter().filter(|run| run.len > 0)
         }
         fn joins_previous<'a>(
             runs: impl Iterator<Item = &'a TextRun>,
@@ -82,30 +131,42 @@ impl TextMeasureInputs {
                     .is_some_and(|previous| previous == decoration_of(run))
             })
         }
-        let (style, other_style) = (&self.text_style, &other.text_style);
-        self.text == other.text
+        let (style, other_style) = (&*self.text_style, &*other.text_style);
+        if !(self.text == other.text
             && self.font_size == other.font_size
             && self.line_height == other.line_height
             && style.white_space == other_style.white_space
             && style.line_clamp == other_style.line_clamp
             && style.text_overflow == other_style.text_overflow
             // Only truncation reads the style's own font.
-            && (!self.truncates() || style.font() == other_style.font())
-            && runs(self).count() == runs(other).count()
-            && runs(self)
-                .zip(runs(other))
+            && (!self.truncates() || same_font(style, other_style)))
+        {
+            return false;
+        }
+        if self.plain() && other.plain() {
+            // One run each, as long as the text, unless there is no text.
+            return self.text.is_empty() || same_font(style, other_style);
+        }
+        let (self_runs, other_runs) = (self.runs(), other.runs());
+        runs(&self_runs).count() == runs(&other_runs).count()
+            && runs(&self_runs)
+                .zip(runs(&other_runs))
                 .all(|(run, other)| run.len == other.len && run.font == other.font)
-            && joins_previous(runs(self)).eq(joins_previous(runs(other)))
+            && joins_previous(runs(&self_runs)).eq(joins_previous(runs(&other_runs)))
     }
 
     /// Whether `self` is painted with what `other` is.
     fn decorated_as(&self, other: &Self) -> bool {
-        self.runs
+        if self.plain() && other.plain() {
+            return self.text.is_empty()
+                || style_decoration(&self.text_style) == style_decoration(&other.text_style);
+        }
+        let (self_runs, other_runs) = (self.runs(), other.runs());
+        self_runs
             .iter()
             .filter(|run| run.len > 0)
             .map(decoration_of)
-            .eq(other
-                .runs
+            .eq(other_runs
                 .iter()
                 .filter(|run| run.len > 0)
                 .map(decoration_of))
@@ -119,10 +180,16 @@ impl TextMeasureInputs {
 /// for it, with every node above it: a view built again would have all of its
 /// text measured and laid out again, though none of it changed. When last
 /// frame's element at this place measured text shaped the same way, its
-/// measurement is copied into this one's layout instead, repainted with this
+/// measurement is carried into this one's layout instead, repainted with this
 /// one's decorations if only they changed, and the node is left clean,
-/// keeping what Taffy cached for it. The new closure is still installed, for
-/// when Taffy measures it again under other constraints.
+/// keeping what Taffy cached for it.
+///
+/// If only the decorations changed, the node is given this element's inputs
+/// to measure from when Taffy measures it again under other constraints.
+/// Otherwise it keeps last frame's, which measure it the same way, only
+/// keeping the measurement in this element's layout from now on: rebuilding
+/// the closure and the inputs of every unchanged text element, and dropping
+/// last frame's, was most of what it cost.
 #[inline]
 pub(crate) fn layout_text(
     layout: &TextLayout,
@@ -131,55 +198,52 @@ pub(crate) fn layout_text(
     window: &mut Window,
     cx: &mut App,
 ) -> LayoutId {
-    let text_style = window.text_style();
+    let text_style = crate::fast::text_style::text_style(window);
     let font_size = text_style.font_size.to_pixels(window.rem_size());
     let line_height = window.pixel_snap(
         text_style
             .line_height
             .to_pixels(font_size.into(), window.rem_size()),
     );
-    let runs = match runs {
-        Some(runs) => SmallVec::from_vec(runs),
-        None => SmallVec::from_buf([text_style.to_run(text.len())]),
-    };
-    let inputs = Rc::new(TextMeasureInputs {
+    let inputs = TextMeasureInputs {
         text,
-        runs,
+        runs: runs.unwrap_or_default(),
         text_style,
         font_size,
         line_height,
-        layout: layout.clone(),
-    });
-    let adopt = {
-        let inputs = inputs.clone();
-        move |previous: &dyn Any| {
-            let Some(previous) = previous.downcast_ref::<TextMeasureInputs>() else {
-                return false;
-            };
-            if !previous.shapes_as(&inputs) {
-                return false;
-            }
-            let recolored = !previous.decorated_as(&inputs);
-            if recolored && inputs.truncates() {
-                return false;
-            }
-            let Some(mut inner) = previous.layout.0.borrow().as_ref().map(copy_measurement) else {
-                return false;
-            };
-            if recolored {
-                update_decoration_runs(&mut inner.lines, &inputs.runs);
-            }
-            *inputs.layout.0.borrow_mut() = Some(inner);
-            true
-        }
+        layout: RefCell::new(layout.clone()),
     };
-    let measure = {
-        let inputs = inputs.clone();
-        move |known_dimensions, available_space, window: &mut Window, cx: &mut App| {
-            measure_text(&inputs, known_dimensions, available_space, window, cx)
-        }
+    window.request_carried_measured_layout(inputs, adopt_measurement, measure_text, cx)
+}
+
+/// Takes over the measurement `previous` left, if it stands for `inputs`. See
+/// [`layout_text`].
+fn adopt_measurement(inputs: &TextMeasureInputs, previous: &dyn Any) -> Adopted {
+    let Some(previous) = previous.downcast_ref::<TextMeasureInputs>() else {
+        return Adopted::No;
     };
-    window.request_carried_measured_layout(inputs, adopt, measure, cx)
+    if !previous.shapes_as(inputs) {
+        return Adopted::No;
+    }
+    let recolored = !previous.decorated_as(inputs);
+    if recolored && inputs.truncates() {
+        return Adopted::No;
+    }
+    let Some(mut inner) = carry_measurement(&previous.layout.borrow()) else {
+        return Adopted::No;
+    };
+    let layout = inputs.layout.borrow();
+    if recolored {
+        update_decoration_runs(&mut inner.lines, &inputs.runs());
+        *layout.0.borrow_mut() = Some(inner);
+        Adopted::Measurement
+    } else {
+        *layout.0.borrow_mut() = Some(inner);
+        // The node keeps `previous`, which now keeps its measurement where
+        // this element looks for it.
+        *previous.layout.borrow_mut() = layout.clone();
+        Adopted::Node
+    }
 }
 
 /// Measures text under the constraints Taffy offers, keeping the result in
@@ -203,12 +267,13 @@ fn measure_text(
 ) -> Size<Pixels> {
     let TextMeasureInputs {
         text,
-        runs,
+        runs: _,
         text_style,
         font_size,
         line_height,
         layout,
     } = inputs;
+    let layout = &*layout.borrow();
     let (font_size, line_height) = (*font_size, *line_height);
     let wrap_width = if text_style.white_space == WhiteSpace::Normal {
         known_dimensions.width.or(match available_space.width {
@@ -244,6 +309,8 @@ fn measure_text(
         return size;
     }
 
+    let runs = inputs.runs();
+    let runs = &*runs;
     let (text, runs) = if let Some(truncate_width) = truncate_width {
         let (truncation_affix, truncate_from) = match text_style.text_overflow.clone() {
             Some(TextOverflow::Truncate(affix)) => (affix, TruncateFrom::End),
@@ -273,7 +340,7 @@ fn measure_text(
         {
             // Truncation sums per-character advances, which overestimates the
             // shaped width, so text that fits once shaped is not truncated.
-            (text.clone(), Cow::Borrowed(&runs[..]))
+            (text.clone(), Cow::Borrowed(runs))
         } else {
             line_wrapper.truncate_line(
                 text.clone(),
@@ -284,7 +351,7 @@ fn measure_text(
             )
         }
     } else {
-        (text.clone(), Cow::Borrowed(&runs[..]))
+        (text.clone(), Cow::Borrowed(runs))
     };
     let len = text.len();
 
@@ -373,6 +440,24 @@ pub(crate) fn update_decoration_runs(lines: &mut [WrappedLine], runs: &[TextRun]
     }
 }
 
+/// What the measurement kept in `layout` left, without where it was last
+/// painted, for another element's layout to take over.
+///
+/// Last frame's element is usually gone by now, and its layout only held by
+/// what it left for this frame's, in which case the measurement is moved out
+/// of it rather than copied line by line. Something may still hold it (an
+/// element kept by a view reused as it was, say, or a caller's clone of a
+/// `StyledText`'s layout), and then it is copied, so it still answers.
+fn carry_measurement(layout: &TextLayout) -> Option<TextLayoutInner> {
+    if Rc::strong_count(&layout.0) == 1 {
+        let mut inner = layout.0.borrow_mut().take()?;
+        inner.bounds = None;
+        Some(inner)
+    } else {
+        layout.0.borrow().as_ref().map(copy_measurement)
+    }
+}
+
 /// A copy of what a measurement left, without where it was last painted.
 fn copy_measurement(inner: &TextLayoutInner) -> TextLayoutInner {
     TextLayoutInner {
@@ -397,15 +482,17 @@ fn copy_measurement(inner: &TextLayoutInner) -> TextLayoutInner {
 impl Window {
     /// Requests a self-measuring leaf, as [`Window::request_measured_layout`]
     /// does, whose measurement can be carried over from the element at the
-    /// same place last frame. `adopt` is given what that element left in
-    /// `memo`, and takes its measurement over if it still stands. Otherwise
-    /// `measure` may be run here, to tell whether it measures what the node
-    /// was measured at before.
-    pub(crate) fn request_carried_measured_layout(
+    /// same place last frame. `adopt` is given `state` and what that element
+    /// measured from, and takes its measurement over if it still stands.
+    /// Otherwise `measure` may be run here, to tell whether it measures what
+    /// the node was measured at before. See
+    /// `TaffyLayoutEngine::request_retained_carried_measured_layout`.
+    pub(crate) fn request_carried_measured_layout<S: 'static>(
         &mut self,
-        memo: Rc<dyn Any>,
-        adopt: impl FnOnce(&dyn Any) -> bool,
+        state: S,
+        adopt: impl FnOnce(&S, &dyn Any) -> Adopted,
         measure: impl Fn(
+            &S,
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
             &mut Window,
@@ -421,10 +508,9 @@ impl Window {
         let mut layout_engine = self.layout_engine.take().unwrap();
         let id = layout_engine.request_retained_carried_measured_layout(
             key,
-            &Style::default(),
             rem_size,
             scale_factor,
-            memo,
+            state,
             adopt,
             measure,
             self,

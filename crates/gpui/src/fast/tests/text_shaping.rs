@@ -4,7 +4,7 @@
 
 use crate::{
     Bounds, DecorationRun, DevicePixels, FontId, FontRun, FontWeight, GlyphId, LineLayout,
-    RenderGlyphParams, ShapedGlyph, ShapedRun, TextStyle, TextStyleRefinement,
+    RenderGlyphParams, ShapedGlyph, ShapedRun, TextAlign, TextStyle, TextStyleRefinement,
     fast::glyphs::{GlyphBoundsCache, has_no_background},
     fast::text::{RECENT_GLYPHS_PER_GENERATION, RecentShapes, fonts_changed},
     fast::text_style::TextStyleStack,
@@ -69,6 +69,28 @@ fn text_style_stack_resolves_as_refining_does() {
 
     stack.clear();
     assert_eq!(*stack.resolve(), TextStyle::default());
+}
+
+#[test]
+fn text_style_stack_aligns_as_it_resolves() {
+    let aligned = |text_align| TextStyleRefinement {
+        text_align: Some(text_align),
+        ..Default::default()
+    };
+    let mut stack = TextStyleStack::default();
+    assert_eq!(stack.text_align(), TextStyle::default().text_align);
+
+    stack.push(aligned(TextAlign::Right));
+    stack.push(refinement(10.));
+    assert_eq!(stack.text_align(), TextAlign::Right);
+    stack.push(aligned(TextAlign::Center));
+    assert_eq!(stack.text_align(), TextAlign::Center);
+    assert_eq!(stack.text_align(), stack.resolve().text_align);
+    stack.pop();
+    assert_eq!(stack.text_align(), TextAlign::Right);
+    stack.clear();
+    stack.push(refinement(10.));
+    assert_eq!(stack.text_align(), TextStyle::default().text_align);
 }
 
 fn line(len: usize) -> LineLayout {
@@ -212,6 +234,38 @@ fn glyph_bounds_cache_answers_only_the_glyph_it_holds() {
         assert!(found.is_none() || found == Some(device_bounds(glyph_id as i32)));
     }
     assert_eq!(cache.get(&glyph(9_999, 2)), Some(device_bounds(9_999)));
+}
+
+/// A glyph's tile in the sprite atlas is kept for the frame it was looked up
+/// in only, since the atlas may be cleared between frames; its raster bounds
+/// are kept on.
+#[test]
+fn glyph_bounds_cache_keeps_a_tile_for_its_frame() {
+    let tile = crate::AtlasTile {
+        texture_id: crate::AtlasTextureId {
+            index: 1,
+            kind: crate::AtlasTextureKind::Monochrome,
+        },
+        tile_id: crate::TileId(3),
+        padding: 0,
+        bounds: device_bounds(5),
+    };
+    let mut cache = GlyphBoundsCache::default();
+    cache.insert_tile(&glyph(7, 0), tile);
+    assert_eq!(cache.lookup(&glyph(7, 0)), None, "no glyph, no tile");
+
+    cache.insert(&glyph(7, 0), device_bounds(5));
+    assert_eq!(cache.lookup(&glyph(7, 0)), Some((device_bounds(5), None)));
+    cache.insert_tile(&glyph(7, 0), tile);
+    cache.insert_tile(&glyph(7, 1), tile);
+    assert_eq!(
+        cache.lookup(&glyph(7, 0)),
+        Some((device_bounds(5), Some(tile)))
+    );
+    assert_eq!(cache.lookup(&glyph(7, 1)), None);
+
+    cache.finish_frame();
+    assert_eq!(cache.lookup(&glyph(7, 0)), Some((device_bounds(5), None)));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! The window's text style stack, which remembers the styles it resolves.
 
-use crate::{TextStyle, TextStyleRefinement, Window};
+use crate::{TextAlign, TextStyle, TextStyleRefinement, Window};
 use refineable::Refineable;
 use std::{cell::RefCell, rc::Rc};
 
@@ -89,9 +89,41 @@ impl TextStyleStack {
     }
 }
 
+impl TextStyleStack {
+    /// The `text_align` of [`Self::resolve`]'s style, without resolving the
+    /// rest of it: the refinement pushed last that sets it decides it.
+    pub(crate) fn text_align(&self) -> TextAlign {
+        let depth = self.refinements.len();
+        if let Some(style) = &self.resolved.borrow()[depth] {
+            return style.text_align;
+        }
+        self.refinements
+            .iter()
+            .rev()
+            .find_map(|refinement| refinement.text_align)
+            // As `TextStyle::default()` has it.
+            .unwrap_or_default()
+    }
+}
+
 /// The text style in effect, as [`Window::text_style`] returns it, without
 /// copying it.
 #[inline]
 pub(crate) fn text_style(window: &Window) -> Rc<TextStyle> {
     window.text_style_stack.resolve()
+}
+
+/// What painting a text element reads of the text style in effect.
+pub(crate) struct TextPaintStyle {
+    pub(crate) text_align: TextAlign,
+}
+
+/// The part of the text style in effect that painting text reads. Resolving
+/// the whole style for it, once for every text element painted, cost more
+/// than painting a short one.
+#[inline]
+pub(crate) fn text_paint_style(window: &Window) -> TextPaintStyle {
+    TextPaintStyle {
+        text_align: window.text_style_stack.text_align(),
+    }
 }
