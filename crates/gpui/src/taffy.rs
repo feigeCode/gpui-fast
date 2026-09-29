@@ -6,7 +6,7 @@ use crate::{
         round_to_device_pixel,
     },
 };
-use collections::{FxHashMap, FxHashSet};
+use collections::FxHashSet;
 use std::{fmt::Debug, ops::Range};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
@@ -31,9 +31,9 @@ pub(crate) struct NodeContext {
 pub struct TaffyLayoutEngine {
     pub(crate) taffy: TaffyTree<NodeContext>,
     pub(crate) retention: crate::fast::layout::LayoutRetention,
-    pub(crate) absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
+    pub(crate) absolute_layout_bounds: crate::fast::layout_bounds::LayoutIdMap<Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
-    pub(crate) absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
+    pub(crate) absolute_outer_origins: crate::fast::layout_bounds::LayoutIdMap<Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     pub(crate) layout_bounds_scratch_space: Vec<LayoutId>,
 }
@@ -47,8 +47,8 @@ impl TaffyLayoutEngine {
         TaffyLayoutEngine {
             taffy,
             retention: crate::fast::layout::LayoutRetention::default(),
-            absolute_layout_bounds: FxHashMap::default(),
-            absolute_outer_origins: FxHashMap::default(),
+            absolute_layout_bounds: crate::fast::layout_bounds::LayoutIdMap::default(),
+            absolute_outer_origins: crate::fast::layout_bounds::LayoutIdMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
         }

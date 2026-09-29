@@ -20,6 +20,7 @@ pub(crate) mod global_id;
 pub(crate) mod glyphs;
 pub(crate) mod interactivity;
 pub(crate) mod layout;
+pub(crate) mod layout_bounds;
 pub(crate) mod layout_key;
 pub(crate) mod path_cache;
 pub(crate) mod retained;
