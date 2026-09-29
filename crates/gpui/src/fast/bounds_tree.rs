@@ -58,7 +58,7 @@ where
     /// same position in `previous` — in its bounds or in its ordering — in
     /// both its old and its new form. An insert that matches `previous` and
     /// meets none of them has the ordering it had then.
-    changed: Vec<Bounds<U>>,
+    changed: ChangedBounds<U>,
     /// How many more bounds replaying may compare against, over every search
     /// it makes, before the tree is built instead.
     replay_search_budget: usize,
@@ -165,6 +165,106 @@ fn cell_end(cell: usize, cells: usize) -> f64 {
         f64::INFINITY
     } else {
         (cell + 1) as f64 * CELL_SIZE
+    }
+}
+
+/// How many columns and rows of cells [`ChangedBounds`] marks, each
+/// [`CELL_SIZE`] across; the first and last reach on without end, as the
+/// grid's do.
+const CHANGED_CELLS: usize = 64;
+
+/// The bounds that changed while a tree is replayed, with the cells of a
+/// coarse grid each reaches into marked, so that an insert reaching into no
+/// marked cell is known to meet none of them without comparing it with each.
+///
+/// Two bounds that intersect overlap along each axis, and so do the cells
+/// they span, which is what a search checks. Bounds whose far edge is not
+/// past their near one, or not a number, span no cells to mark or check;
+/// once one has changed, or for such a search, every changed bounds is
+/// compared.
+#[derive(Debug)]
+struct ChangedBounds<U>
+where
+    U: Clone + Debug + Default + PartialEq,
+{
+    bounds: Vec<Bounds<U>>,
+    /// Row by row, a bit per column.
+    rows: [u64; CHANGED_CELLS],
+    /// Whether a changed bounds spans no cells, so that none can be ruled
+    /// out by them.
+    unmarked: bool,
+}
+
+impl<U> ChangedBounds<U>
+where
+    U: Clone
+        + Debug
+        + PartialEq
+        + PartialOrd
+        + Add<U, Output = U>
+        + Sub<Output = U>
+        + Half
+        + Default
+        + Into<f64>,
+{
+    fn clear(&mut self) {
+        self.bounds.clear();
+        self.rows = [0; CHANGED_CELLS];
+        self.unmarked = false;
+    }
+
+    /// The first and last column, and the first and last row, of the cells
+    /// `bounds` spans, if it spans any.
+    fn cells(bounds: &Bounds<U>) -> Option<(usize, usize, usize, usize)> {
+        let left: f64 = bounds.origin.x.clone().into();
+        let top: f64 = bounds.origin.y.clone().into();
+        let right: f64 = (bounds.origin.x.clone() + bounds.size.width.clone()).into();
+        let bottom: f64 = (bounds.origin.y.clone() + bounds.size.height.clone()).into();
+        // False for a NaN at either end.
+        (right >= left && bottom >= top).then(|| {
+            (
+                cell_at(left, CHANGED_CELLS),
+                cell_at(right, CHANGED_CELLS),
+                cell_at(top, CHANGED_CELLS),
+                cell_at(bottom, CHANGED_CELLS),
+            )
+        })
+    }
+
+    /// The bits of the columns `first..=last`.
+    fn columns(first: usize, last: usize) -> u64 {
+        (u64::MAX >> (CHANGED_CELLS - 1 - last)) & (u64::MAX << first)
+    }
+
+    fn push(&mut self, bounds: &Bounds<U>) {
+        match Self::cells(bounds) {
+            Some((left, right, top, bottom)) => {
+                let columns = Self::columns(left, right);
+                for row in &mut self.rows[top..=bottom] {
+                    *row |= columns;
+                }
+            }
+            None => self.unmarked = true,
+        }
+        self.bounds.push(bounds.clone());
+    }
+
+    /// Whether `bounds` might meet a changed bounds: false only when it
+    /// cannot.
+    fn might_meet(&self, bounds: &Bounds<U>) -> bool {
+        if self.bounds.is_empty() {
+            return false;
+        }
+        if self.unmarked {
+            return true;
+        }
+        match Self::cells(bounds) {
+            Some((left, right, top, bottom)) => {
+                let columns = Self::columns(left, right);
+                self.rows[top..=bottom].iter().any(|row| row & columns != 0)
+            }
+            None => true,
+        }
     }
 }
 
@@ -378,16 +478,22 @@ where
     /// worked out from what has been inserted so far, and if that differs
     /// from last time, the bounds join the ones that changed.
     fn replay(&mut self, bounds: &Bounds<U>) -> Option<u32> {
-        self.replay_search_budget = self.replay_search_budget.checked_sub(self.changed.len())?;
         let previous = self.previous.get(self.recorded.len());
         if let Some((previous_bounds, ordering)) = previous
             && previous_bounds == bounds
-            && !self
-                .changed
-                .iter()
-                .any(|changed| changed.intersects(bounds))
         {
-            return Some(*ordering);
+            let meets_changed = self.changed.might_meet(bounds) && {
+                self.replay_search_budget = self
+                    .replay_search_budget
+                    .checked_sub(self.changed.bounds.len())?;
+                self.changed
+                    .bounds
+                    .iter()
+                    .any(|changed| changed.intersects(bounds))
+            };
+            if !meets_changed {
+                return Some(*ordering);
+            }
         }
 
         self.replay_search_budget = self.replay_search_budget.checked_sub(self.recorded.len())?;
@@ -402,13 +508,13 @@ where
         match previous {
             Some((previous_bounds, previous_ordering)) => {
                 if previous_bounds != bounds {
-                    self.changed.push(previous_bounds.clone());
-                    self.changed.push(bounds.clone());
+                    self.changed.push(previous_bounds);
+                    self.changed.push(bounds);
                 } else if *previous_ordering != ordering {
-                    self.changed.push(bounds.clone());
+                    self.changed.push(bounds);
                 }
             }
-            None => self.changed.push(bounds.clone()),
+            None => self.changed.push(bounds),
         }
         Some(ordering)
     }
@@ -492,7 +598,11 @@ where
             recorded: Vec::new(),
             previous: Vec::new(),
             replaying: false,
-            changed: Vec::new(),
+            changed: ChangedBounds {
+                bounds: Vec::new(),
+                rows: [0; CHANGED_CELLS],
+                unmarked: false,
+            },
             replay_search_budget: REPLAY_SEARCH_BUDGET,
         }
     }
@@ -715,6 +825,57 @@ mod tests {
                     + 1;
                 expected_quads.push((bounds, expected_ordering));
                 assert_eq!(tree.insert(bounds), expected_ordering);
+            }
+        }
+    }
+
+    /// A frame repeating the last one but for a few bounds, where bounds of
+    /// every awkward kind come and go, and lie anywhere — past the cells
+    /// changed bounds are marked in too — is still replayed only as far as
+    /// inserting it afresh would give.
+    #[test]
+    fn replaying_past_awkward_changes_gives_what_inserting_it_would() {
+        let edge = CELL_SIZE as f32;
+        let coordinate = |rng: &mut rand::rngs::StdRng| match rng.random_range(0..14) {
+            0 => f32::INFINITY,
+            1 => f32::NEG_INFINITY,
+            2 => f32::NAN,
+            3 => rng.random_range(-4..(CHANGED_CELLS as i32 + 4)) as f32 * edge,
+            4..8 => rng.random_range(-3..8) as f32 * edge,
+            8 => rng.random_range(0.0..(CHANGED_CELLS as f32 + 8.) * edge),
+            _ => rng.random_range(-2.0 * edge..6.0 * edge),
+        };
+        let length = |rng: &mut rand::rngs::StdRng| match rng.random_range(0..12) {
+            0 => 0.,
+            1 => -rng.random_range(0.0..edge),
+            2 => f32::INFINITY,
+            3 => f32::NAN,
+            4..7 => rng.random_range(0..4) as f32 * edge,
+            _ => rng.random_range(0.0..3.0 * edge),
+        };
+        let awkward = |rng: &mut rand::rngs::StdRng| Bounds {
+            origin: Point {
+                x: coordinate(rng),
+                y: coordinate(rng),
+            },
+            size: Size {
+                width: length(rng),
+                height: length(rng),
+            },
+        };
+        for seed in 1..=400 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut tree = BoundsTree::default();
+            let mut frame: Vec<_> = (0..rng.random_range(1..200))
+                .map(|_| awkward(&mut rng))
+                .collect();
+            fill(&mut tree, &frame);
+            for _ in 0..4 {
+                for _ in 0..rng.random_range(0..6) {
+                    let at = rng.random_range(0..frame.len());
+                    frame[at] = awkward(&mut rng);
+                }
+                fill(&mut tree, &frame);
             }
         }
     }
