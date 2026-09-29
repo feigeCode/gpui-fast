@@ -888,13 +888,30 @@ pub(crate) fn resolve_font(text_system: &crate::TextSystem, font: &crate::Font) 
     font_id
 }
 
-/// Upstream's [`TextSystem::resolve_font`]: the font, or else the first of
-/// the fallbacks that resolves.
+/// [`TextSystem::resolve_font`]: the font, or else the first of the
+/// fallbacks that resolves — in the weight and style asked for, with the
+/// features asked for, where the fallback family has them.
+///
+/// Upstream resolves a fallback as the fallback stack names it, plain: text
+/// asked for in bold came out regular, and with its features — tabular
+/// numerals, say — dropped, so digits of a family that isn't installed took
+/// their proportional widths, and a ticking price changed width, and laid
+/// out its row again, every time it changed.
 fn resolve_font_uncached(text_system: &crate::TextSystem, font: &crate::Font) -> crate::FontId {
     if let Ok(font_id) = text_system.font_id(font) {
         return font_id;
     }
     for fallback in &text_system.fallback_font_stack {
+        let as_asked = crate::Font {
+            family: fallback.family.clone(),
+            features: font.features.clone(),
+            fallbacks: font.fallbacks.clone(),
+            weight: font.weight,
+            style: font.style,
+        };
+        if let Ok(font_id) = text_system.font_id(&as_asked) {
+            return font_id;
+        }
         if let Ok(font_id) = text_system.font_id(fallback) {
             return font_id;
         }
