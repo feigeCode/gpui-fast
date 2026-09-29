@@ -15,6 +15,7 @@
 //! root one by one, in `gpui.rs`.
 
 pub(crate) mod dependencies;
+pub(crate) mod dispatch;
 pub(crate) mod global_id;
 pub(crate) mod glyphs;
 pub(crate) mod interactivity;

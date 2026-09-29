@@ -579,16 +579,25 @@ impl Window {
                 &mut copied,
             );
 
-            // The gap hangs off the dispatch node it hung off last frame.
+            // The gap hangs off the dispatch node it hung off last frame: its
+            // element's own node, which its element pushed before the view
+            // began and which was copied with the stretch before it. Pushing
+            // another would nest the gap one node deeper every frame.
             let parent =
                 self.rendered_frame.dispatch_tree.nodes[gap_range.start.dispatch_tree_index].parent;
             dispatch.unwind_to(parent, &mut self.next_frame.dispatch_tree);
+            let copied_node = parent
+                .and_then(|parent| dispatch.copied(parent))
+                .filter(|&node| self.next_frame.dispatch_tree.active_node_id() == Some(node));
             let inherited =
                 self.enter_gap(&gap_id, &rebuild, context.content_mask, context.opacity);
             // What its element's prepaint does, inside the view around it.
             let bounds = self.layout_bounds(gap.layout_id);
             self.element_id_stack.push(gap.element_id());
-            let node = self.next_frame.dispatch_tree.push_node();
+            let node = match copied_node {
+                Some(node) => node,
+                None => self.next_frame.dispatch_tree.push_node(),
+            };
             let scope = crate::fast::layout_key::enter_prepaint_scope(self, gap.layout_key);
             let prepaint = crate::fast::retained::prepaint_view(
                 &mut gap.view,
@@ -599,7 +608,9 @@ impl Window {
                 cx,
             );
             crate::fast::layout_key::exit_prepaint_scope(self, scope);
-            self.next_frame.dispatch_tree.pop_node();
+            if copied_node.is_none() {
+                self.next_frame.dispatch_tree.pop_node();
+            }
             self.element_id_stack.pop();
             gap.prepainted = Some((node, prepaint));
             self.leave_gap(inherited);
@@ -906,23 +917,7 @@ impl OpenDispatchCopy {
         focus: Option<FocusId>,
     ) -> bool {
         self.stretches.push((range.clone(), target.len()));
-        let mut contains_focus = false;
-        for index in range {
-            let node = &mut source.nodes[index];
-            while let Some(&open) = self.open.last() {
-                if node.parent == Some(open) {
-                    break;
-                }
-                self.open.pop();
-                target.pop_node();
-            }
-            self.open.push(DispatchNodeId(index));
-            if node.focus_id.is_some() && node.focus_id == focus {
-                contains_focus = true;
-            }
-            target.move_node(node);
-        }
-        contains_focus
+        crate::fast::dispatch::copy_nodes(target, source, range, Some(&mut self.open), focus)
     }
 
     /// Closes open nodes until the innermost is `parent`, or none is.
@@ -942,12 +937,17 @@ impl OpenDispatchCopy {
 
     /// Where last frame's node `node`, which was copied, is now.
     fn refresh(&self, node: DispatchNodeId) -> DispatchNodeId {
+        self.copied(node)
+            .expect("a copied deferred draw hangs off a copied node")
+    }
+
+    /// Where last frame's node `node` is now, if it was copied.
+    fn copied(&self, node: DispatchNodeId) -> Option<DispatchNodeId> {
         let (range, start) = self
             .stretches
             .iter()
-            .find(|(range, _)| range.contains(&node.0))
-            .expect("a copied deferred draw hangs off a copied node");
-        DispatchNodeId(node.0 - range.start + start)
+            .find(|(range, _)| range.contains(&node.0))?;
+        Some(DispatchNodeId(node.0 - range.start + start))
     }
 }
 

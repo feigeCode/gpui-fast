@@ -1605,6 +1605,52 @@ fn a_view_around_one_whose_model_changed_is_drawn_around_it() {
     assert_eq!(changed, draw_shell(&mut cx, window));
 }
 
+/// A view drawn around a nested view hangs it off the dispatch node its
+/// element had, copied from last frame, as building the view around it
+/// would: drawn around it frame after frame, its dispatch tree is the one a
+/// build gives, rather than a node deeper each frame.
+#[test]
+fn a_view_drawn_around_a_nested_view_keeps_its_dispatch_tree() {
+    let mut cx = TestAppContext::single();
+    let inner_builds = Rc::new(Cell::new(0));
+    let model = cx.new(|_| Model(0));
+    let (window, outer_builds) = shell(&mut cx, {
+        let (inner_builds, model) = (inner_builds.clone(), model.clone());
+        move |cx| {
+            cx.new(|_| Tinted {
+                tint: 0,
+                model: Some(model),
+                builds: inner_builds,
+            })
+            .into()
+        }
+    });
+    let describe = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, _| {
+            let tree = &window.rendered_frame.dispatch_tree;
+            tree.nodes
+                .iter()
+                .map(|node| (node.parent.map(|parent| parent.0), node.view_id))
+                .collect::<Vec<_>>()
+        })
+        .unwrap()
+    };
+    draw_shell(&mut cx, window);
+    let built = describe(&mut cx);
+    for value in 1..4 {
+        model.update(&mut cx, |model, cx| {
+            model.0 = value;
+            cx.notify();
+        });
+        assert_eq!(
+            describe(&mut cx),
+            built,
+            "after {value} frames drawn around"
+        );
+    }
+    assert_eq!((outer_builds.get(), inner_builds.get()), (1, 4));
+}
+
 fn describe_shell(cx: &mut TestAppContext, window: WindowHandle<Shell>) -> Vec<String> {
     cx.update_window(window.into(), |_, window, _| {
         window.describe_rendered_frame()
