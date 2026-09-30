@@ -17,54 +17,137 @@ use anyhow::{Context as _, Result};
 use gpui::{Path, PrimitiveBatch, ScaledPixels, Scene};
 use windows::Win32::Graphics::{
     Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP},
-    Direct3D11::{ID3D11Buffer, ID3D11DeviceContext, ID3D11SamplerState, ID3D11ShaderResourceView},
+    Direct3D11::{
+        ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11SamplerState,
+        ID3D11ShaderResourceView,
+    },
 };
 
-use crate::DirectXRenderer;
 use crate::directx_renderer::{
-    DirectXResources, PathRasterizationSprite, PathSprite, PipelineState, RENDER_TARGET_FORMAT,
+    DirectXGlobalElements, DirectXRenderPipelines, DirectXResources, PathRasterizationSprite,
+    PathSprite, PipelineState, RENDER_TARGET_FORMAT,
 };
 use crate::fast::draw_state::DrawState;
 use crate::fast::globals::UploadedGlobals;
+use crate::fast::layers::{TileCache, composite};
+use crate::{DirectXAtlas, DirectXRenderer};
 
 /// The renderer's gpui-fast state, kept from frame to frame.
 #[derive(Default)]
 pub(crate) struct FrameState {
     pub(crate) globals: UploadedGlobals,
-    state: DrawState,
+    pub(crate) state: DrawState,
     path_vertices: Vec<PathRasterizationSprite>,
     path_sprites: Vec<PathSprite>,
+    /// The scroll layer tiles the frames composite.
+    pub(crate) layers: TileCache,
+}
+
+/// The Direct3D objects a scene is drawn with.
+pub(crate) struct Target<'a> {
+    pub(crate) device: &'a ID3D11Device,
+    pub(crate) device_context: &'a ID3D11DeviceContext,
+    pub(crate) atlas: &'a DirectXAtlas,
+    pub(crate) globals: &'a DirectXGlobalElements,
+    /// The window's render target and path textures, which the frame's
+    /// paths are drawn through; `None` for targets that never draw paths.
+    pub(crate) resources: Option<&'a DirectXResources>,
 }
 
 /// Draws `scene`'s batches in place of `DirectXRenderer::render`'s loop, once
 /// the scene's instances are uploaded. Returns `false`, having drawn nothing,
 /// when a graphics debugger is capturing and upstream's labeled loop should
-/// run instead.
+/// run instead; that loop cannot draw layer tiles, so a scene compositing
+/// them is drawn here regardless.
 pub(crate) fn draw_batches(renderer: &mut DirectXRenderer, scene: &Scene) -> Result<bool> {
     let devices = renderer.devices.as_ref().context("devices missing")?;
     let capturing = devices
         .annotation
         .as_ref()
         .is_some_and(|annotation| unsafe { annotation.GetStatus().as_bool() });
-    if capturing {
+    if capturing && scene.layers.frames.is_empty() {
         return Ok(false);
     }
     let resources = renderer.resources.as_ref().context("resources missing")?;
-    let pipelines = &mut renderer.pipelines;
-    let globals = &renderer.globals;
-    let batch_params = globals
+    let target = Target {
+        device: &devices.device,
+        device_context: &devices.device_context,
+        atlas: &renderer.atlas,
+        globals: &renderer.globals,
+        resources: Some(resources),
+    };
+    draw_scene(
+        &target,
+        &mut renderer.pipelines,
+        &mut renderer.fast_frame,
+        scene,
+    )?;
+    Ok(true)
+}
+
+/// Uploads `scene`'s instances to the pipelines' buffers, as
+/// `DirectXRenderer::upload_scene_buffers` does.
+pub(crate) fn upload(
+    target: &Target<'_>,
+    pipelines: &mut DirectXRenderPipelines,
+    scene: &Scene,
+) -> Result<()> {
+    let (device, context) = (target.device, target.device_context);
+    if !scene.shadows.is_empty() {
+        let pipeline = &mut pipelines.shadow_pipeline;
+        pipeline.update_buffer(device, context, &scene.shadows)?;
+    }
+    if !scene.quads.is_empty() {
+        let pipeline = &mut pipelines.quad_pipeline;
+        pipeline.update_buffer(device, context, &scene.quads)?;
+    }
+    if !scene.underlines.is_empty() {
+        let pipeline = &mut pipelines.underline_pipeline;
+        pipeline.update_buffer(device, context, &scene.underlines)?;
+    }
+    if !scene.monochrome_sprites.is_empty() {
+        let pipeline = &mut pipelines.mono_sprites;
+        pipeline.update_buffer(device, context, &scene.monochrome_sprites)?;
+    }
+    if !scene.subpixel_sprites.is_empty() {
+        let pipeline = &mut pipelines.subpixel_sprites;
+        pipeline.update_buffer(device, context, &scene.subpixel_sprites)?;
+    }
+    if !scene.polychrome_sprites.is_empty() {
+        let pipeline = &mut pipelines.poly_sprites;
+        pipeline.update_buffer(device, context, &scene.polychrome_sprites)?;
+    }
+    Ok(())
+}
+
+/// Draws `scene`'s batches, whose instances are uploaded, into the render
+/// target bound on the device context.
+pub(crate) fn draw_scene(
+    target: &Target<'_>,
+    pipelines: &mut DirectXRenderPipelines,
+    frame: &mut FrameState,
+    scene: &Scene,
+) -> Result<()> {
+    let batch_params = target
+        .globals
         .batch_params_buffer
         .as_ref()
         .context("batch params buffer missing")?;
-    let frame = &mut renderer.fast_frame;
-    let device_context = &devices.device_context;
-    frame.state.forget();
+    let FrameState {
+        state,
+        path_vertices,
+        path_sprites,
+        layers,
+        ..
+    } = frame;
+    let device_context = target.device_context;
+    state.forget();
 
     let mut draw = Draw {
         device_context,
-        state: &mut frame.state,
+        state,
         batch_params,
-        sampler: &globals.sampler,
+        sampler: &target.globals.sampler,
     };
     for batch in scene.batches() {
         match batch {
@@ -79,21 +162,26 @@ pub(crate) fn draw_batches(renderer: &mut DirectXRenderer, scene: &Scene) -> Res
                 if paths.is_empty() {
                     continue;
                 }
+                let Some(resources) = target.resources else {
+                    // Layer tiles never hold paths (spec §5.6).
+                    debug_assert!(false, "paths drawn into a target without path textures");
+                    continue;
+                };
                 rasterize_paths(
                     &mut draw,
-                    &devices.device,
+                    target.device,
                     resources,
                     &mut pipelines.path_rasterization_pipeline,
-                    &mut frame.path_vertices,
+                    path_vertices,
                     paths,
                 )
                 .and_then(|()| {
                     composite_paths(
                         &mut draw,
-                        &devices.device,
+                        target.device,
                         resources,
                         &mut pipelines.path_sprite_pipeline,
-                        &mut frame.path_sprites,
+                        path_sprites,
                         paths,
                     )
                 })
@@ -105,17 +193,31 @@ pub(crate) fn draw_batches(renderer: &mut DirectXRenderer, scene: &Scene) -> Res
                 None,
             ),
             PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                let [view] = renderer.atlas.get_texture_view(texture_id);
+                let [view] = target.atlas.get_texture_view(texture_id);
                 let pipeline = &pipelines.mono_sprites;
                 draw.instances(pipeline, range.start, range.len(), Some(&view))
             }
             PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                let [view] = renderer.atlas.get_texture_view(texture_id);
+                let [view] = target.atlas.get_texture_view(texture_id);
                 let pipeline = &pipelines.subpixel_sprites;
                 draw.instances(pipeline, range.start, range.len(), Some(&view))
             }
+            PrimitiveBatch::PolychromeSprites { texture_id, range }
+                if composite::is_layer_texture(texture_id) =>
+            {
+                let sprites = &scene.polychrome_sprites;
+                composite::tile_runs(sprites, range).try_for_each(|run| {
+                    let Some(view) =
+                        composite::texture_for_run(layers, texture_id, &sprites[run.clone()])
+                    else {
+                        return Ok(());
+                    };
+                    let pipeline = &pipelines.poly_sprites;
+                    draw.instances(pipeline, run.start, run.len(), Some(view))
+                })
+            }
             PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                let [view] = renderer.atlas.get_texture_view(texture_id);
+                let [view] = target.atlas.get_texture_view(texture_id);
                 let pipeline = &pipelines.poly_sprites;
                 draw.instances(pipeline, range.start, range.len(), Some(&view))
             }
@@ -124,7 +226,7 @@ pub(crate) fn draw_batches(renderer: &mut DirectXRenderer, scene: &Scene) -> Res
         }
         .with_context(|| scene_too_large(scene))?;
     }
-    Ok(true)
+    Ok(())
 }
 
 /// What every batch's draw needs.
@@ -169,7 +271,7 @@ impl Draw<'_> {
 /// Upstream's `DirectXRenderer::draw_paths_to_intermediate`.
 fn rasterize_paths(
     draw: &mut Draw<'_>,
-    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    device: &ID3D11Device,
     resources: &DirectXResources,
     pipeline: &mut PipelineState<PathRasterizationSprite>,
     vertices: &mut Vec<PathRasterizationSprite>,
@@ -219,7 +321,7 @@ fn rasterize_paths(
 /// Upstream's `DirectXRenderer::draw_paths_from_intermediate`.
 fn composite_paths(
     draw: &mut Draw<'_>,
-    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    device: &ID3D11Device,
     resources: &DirectXResources,
     pipeline: &mut PipelineState<PathSprite>,
     sprites: &mut Vec<PathSprite>,

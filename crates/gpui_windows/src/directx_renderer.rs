@@ -264,6 +264,7 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+        crate::fast::layers::release_tiles(self);
         let disable_direct_composition = self.direct_composition.is_none();
 
         unsafe {
@@ -354,6 +355,7 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        crate::fast::layers::raster::rasterize_tiles(self, scene)?;
         self.pre_draw(&match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
@@ -496,6 +498,7 @@ impl DirectXRenderer {
         }
         self.width = width;
         self.height = height;
+        crate::fast::layers::release_tiles(self);
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -1068,12 +1071,12 @@ impl DirectXGlobalElements {
 #[derive(Debug, Default)]
 #[repr(C)]
 pub(crate) struct GlobalParams {
-    gamma_ratios: [f32; 4],
-    viewport_size: [f32; 2],
-    grayscale_enhanced_contrast: f32,
-    subpixel_enhanced_contrast: f32,
-    is_bgr: u32,
-    _pad: [u32; 3],
+    pub(crate) gamma_ratios: [f32; 4],
+    pub(crate) viewport_size: [f32; 2],
+    pub(crate) grayscale_enhanced_contrast: f32,
+    pub(crate) subpixel_enhanced_contrast: f32,
+    pub(crate) is_bgr: u32,
+    pub(crate) _pad: [u32; 3],
 }
 
 #[derive(Clone, Copy, Debug, Default)]

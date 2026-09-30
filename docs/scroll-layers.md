@@ -87,6 +87,9 @@ frame.
   the positions listeners observe.
 - `cargo test -p gpui_wgpu` compares rasterized and composited tiles with
   direct drawing, byte for byte, on a surfaceless device.
+- `cargo test -p gpui_windows --features test-support fast::layers` does the
+  same for the Direct3D 11 renderer (`gpui_windows/src/fast/layers/`), on a
+  hardware device or WARP, on Windows.
 - `cargo run -p gpui_perf --release -- --headless --verify` also runs the
   scroll scenarios with layers on and off.
 
