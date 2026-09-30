@@ -203,3 +203,92 @@ fn a_view_drawn_again_carries_what_a_spliced_view_in_it_did_not(cx: &mut TestApp
         draw(cx);
     }
 }
+
+/// Draws `window` again after notifying its view, returning the frame's
+/// statistics.
+fn draw_notified<V: Render>(
+    window: WindowHandle<V>,
+    cx: &mut TestAppContext,
+) -> crate::LayoutStats {
+    cx.update_window(window.into(), |_, window, _| window.reset_layout_stats())
+        .unwrap();
+    window.update(cx, |_, _, cx| cx.notify()).unwrap();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.layout_stats()
+    })
+    .unwrap()
+}
+
+/// An element built again only because its text was measured again did not
+/// move, so it is recorded on the very next frame and drawn again on the one
+/// after, rather than waiting a frame to be found standing still.
+#[gpui::test]
+fn text_measured_again_in_place_is_drawn_again_two_frames_later(cx: &mut TestAppContext) {
+    let window: WindowHandle<Narrowing> = cx.add_window(|_, _| Narrowing { width: 200. });
+    for _ in 0..3 {
+        draw_notified(window, cx);
+    }
+    assert!(draw_notified(window, cx).elements_reused > 0);
+
+    window
+        .update(cx, |narrowing, _, _| narrowing.width = 150.)
+        .unwrap();
+    let stats = draw_notified(window, cx);
+    assert!(stats.measure_calls > 0, "{stats:?}");
+    assert_eq!(stats.elements_reused, 0, "{stats:?}");
+
+    let stats = draw_notified(window, cx);
+    assert_eq!(stats.elements_reused, 0, "recorded again: {stats:?}");
+    let stats = draw_notified(window, cx);
+    assert!(stats.elements_reused > 0, "drawn again: {stats:?}");
+}
+
+struct Lists {
+    list: crate::ListState,
+}
+
+fn list_row(ix: usize) -> impl IntoElement {
+    div()
+        .h(px(20.))
+        .child(SharedString::from(format!("row {ix}")))
+}
+
+impl Render for Lists {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .child(
+                crate::list(self.list.clone(), |ix, _, _| {
+                    list_row(ix).into_any_element()
+                })
+                .w(px(100.))
+                .h(px(200.)),
+            )
+            .child(
+                crate::uniform_list("rows", 20, |range, _, _| {
+                    range.map(list_row).collect::<Vec<_>>()
+                })
+                .w(px(100.))
+                .h(px(200.)),
+            )
+    }
+}
+
+/// The items of a `list` and a `uniform_list` are laid out apart from the
+/// view they are drawn in, and a list lays out the item it measures once
+/// more; neither may keep an unchanged item from being drawn again.
+#[gpui::test]
+fn unchanged_list_items_are_drawn_again(cx: &mut TestAppContext) {
+    let window: WindowHandle<Lists> = cx.add_window(|_, _| Lists {
+        list: crate::ListState::new(20, crate::ListAlignment::Top, px(0.)),
+    });
+    for _ in 0..3 {
+        draw_notified(window, cx);
+    }
+    let stats = draw_notified(window, cx);
+    // Ten visible rows of each list, a div and its text each.
+    assert_eq!(stats.elements_reused, 40, "{stats:?}");
+    assert_eq!(stats.elements_built, 0, "{stats:?}");
+}

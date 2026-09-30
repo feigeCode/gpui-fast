@@ -1119,10 +1119,11 @@ fn prepaint_retained<E: Element>(drawable: &mut Drawable<E>, window: &mut Window
                 Some(built) => built,
                 None => {
                     if root {
-                        // Moved: drawn as upstream draws it until it stands
-                        // still again.
+                        // Drawn as upstream draws it, and recorded from the
+                        // next frame on if it stood where it was.
                         let bounds = window.layout_bounds(kept.layout_id);
-                        leave_placement(kept.key, bounds, false, window);
+                        let still = previous_bounds(&kept, window) == bounds;
+                        leave_placement(kept.key, bounds, still, window);
                     }
                     drawable.fast_retention.phase = Phase::Plain;
                     return drawable.prepaint(window, cx);
@@ -1150,9 +1151,20 @@ fn prepaint_retained<E: Element>(drawable: &mut Drawable<E>, window: &mut Window
     drawable.fast_retention.phase = Phase::Recorded { root, index };
 }
 
+/// Where the record `kept` kept its layout from was drawn last frame.
+fn previous_bounds(kept: &KeptLayout, window: &Window) -> Bounds<Pixels> {
+    window
+        .rendered_frame
+        .retained
+        .elements
+        .record(kept.previous)
+        .context
+        .bounds
+}
+
 /// Builds an element whose layout was kept from last frame, but which cannot
 /// be drawn again from it because it is drawn somewhere else: it moved, or
-/// what it inherits changed. Its layout is requested now, as it would have
+/// what it inherits changed, or its text was measured again. Its layout is requested now, as it would have
 /// been, which finds the nodes it kept as they were.
 #[inline(never)]
 fn build_at_kept_layout<E: Element>(
@@ -1163,6 +1175,7 @@ fn build_at_kept_layout<E: Element>(
     cx: &mut App,
 ) -> Option<BuiltLayout> {
     let bounds = window.layout_bounds(kept.layout_id);
+    let previous_bounds = previous_bounds(kept, window);
     {
         let records = &window.rendered_frame.retained.elements;
         let keys = &mut window.retained_state.element_keys;
@@ -1184,14 +1197,15 @@ fn build_at_kept_layout<E: Element>(
     if !unchanged {
         window.request_animation_frame();
     }
-    // Moved: a root is left without records, one nested in an element
-    // being recorded is recorded as moving.
+    // A root is left without records, one nested in an element being
+    // recorded is recorded as moving; either is recorded in full from the
+    // next frame on if it stood where it was.
     (!root).then_some(BuiltLayout {
         key: kept.key,
         snapshot: Snapshot::Moving,
         layout_id,
         claimed: 0,
-        previous_bounds: None,
+        previous_bounds: Some(previous_bounds),
     })
 }
 
