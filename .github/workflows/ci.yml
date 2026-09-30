@@ -44,6 +44,10 @@ jobs:
       - name: Test gpui
         run: cargo test -p gpui --features test-support
 
+      - name: Test scroll layers on Direct3D
+        if: runner.os == 'Windows'
+        run: cargo test -p gpui_windows --features test-support fast::layers -- --nocapture
+
       - name: Check gpui_perf
         run: cargo check -p gpui_perf --all-targets
 
