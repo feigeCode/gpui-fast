@@ -15,23 +15,33 @@ drawing as it does without layers, and how to verify and measure layers.
 
 ## Where layers apply
 
-- Linux, on the wgpu renderer. Everywhere else layers are compiled out
-  (`fast::layers::COMPILED`), and nothing changes.
+- Linux, on the wgpu renderer, and macOS, on the Metal renderer. Everywhere
+  else layers are compiled out (`fast::layers::COMPILED`), and nothing
+  changes.
 - Scrolling `div`s (`overflow_x_scroll` / `overflow_y_scroll`), whether their
   content is a child view or plain elements in the same view.
-- Not yet `uniform_list` or `list`: `fast::layers::lists::LIST_LAYERS` is off,
-  and the list layer tests are `#[ignore]`d. As built, list layers do not pay
-  off, for three reasons, each enough on its own:
-  - Rows that take input (hover, click, cursor) are never given a layer. A
-    list layer cannot carry a row's hitboxes, listeners and dispatch nodes
-    through a composited frame.
-  - Hovers are recorded for the whole layer. Rows moving under a still pointer
-    change the hovered row on most frames, and each change repaints every
-    held row.
-  - A frame that adds rows rebuilds the whole content scene and re-hashes
-    every tile, which costs about three times drawing without a layer.
-  Making list layers pay off needs per-row input records, per-row hover
-  checks, and content that can be assembled row by row.
+- `uniform_list` and `list` (`fast::layers::lists`), unless flipped
+  vertically. A list's layer holds the rows its viewport shows and two
+  viewports of rows on each side, each row kept apart:
+  - A frame that only scrolled the list renders only the rows the scroll
+    brought into the overscan, the rows whose hover changes and the rows
+    that show again after leaving the viewport. Every other row it keeps:
+    it is not rendered, laid out, prepainted or painted, and its hitboxes,
+    listeners, element states and dispatch nodes are carried from the last
+    frame, its hitboxes moved by the scroll since the row was painted.
+  - The frame hit tests the pointer between prepaint and paint, and hover
+    styles are painted by that. Which rows to render again for their hover is
+    decided as the rows prepaint, so the hit test is foretold: the last
+    frame's hitboxes, the rows' moved to where they show now. Only the
+    rows whose hover changes are rendered again, not the whole layer.
+  - A list without a layer drops the element states of a row it no longer
+    shows (a nested scroll offset, say). A row leaving the viewport is
+    neither rendered nor keeps its element states that frame, and is
+    rendered afresh before it shows again.
+  - The layer's content is one part per row (`LayerContent`), and each row's
+    tiles are hashed once, when it is painted. A frame adding a row hands the
+    renderer the other rows as they were and rasterizes only the tiles the
+    new row reaches. Rows past the overscan are dropped a batch at a time.
 - `GPUI_SCROLL_LAYERS=0` turns layers off for a process.
   `Window::set_scroll_layers` does the same for one window in tests.
 
@@ -72,10 +82,18 @@ frame.
   shift (`fast::glyphs::quantize_origin`). On screen the result is unchanged.
 - Tiles are cleared with the baked background, so subpixel text blends exactly
   as it does on screen.
+- Metal's gradient dither is seeded from the position within the quad, not on
+  screen, so a gradient gets the same noise in a tile as in the window.
 - Before any input other than the wheel reaches a layer that has moved since
   it was painted, the layer is repainted (`fast::layers::input`). Listeners,
   element state and anything handed to application code therefore hold
-  current window coordinates.
+  current window coordinates. A list's rows are painted over many frames,
+  at as many offsets: any row painted at another offset than the one shown
+  counts as moved.
+- A list's rows are painted in a region reaching far above and below the
+  viewport instead of inside the list's own clip, so that no edge of what
+  a row was painted in clips it once it has moved; the viewport clips it
+  where it is composited, as the list's clip does without a layer.
 
 ## Verifying
 
@@ -87,6 +105,9 @@ frame.
   the positions listeners observe.
 - `cargo test -p gpui_wgpu` compares rasterized and composited tiles with
   direct drawing, byte for byte, on a surfaceless device.
+- `cargo test -p gpui_apple fast::layers` does the same on macOS with a
+  headless Metal renderer (`crates/gpui_apple/src/fast/layers/`), which draws
+  tiles as the wgpu renderer does.
 - `cargo test -p gpui_windows --features test-support fast::layers` does the
   same for the Direct3D 11 renderer (`gpui_windows/src/fast/layers/`), on a
   hardware device or WARP, on Windows.
@@ -100,10 +121,16 @@ pointer over the content. Linux, release build, retained views on, 300 frames:
 
 | Scenario | Layers off | Layers on |
 |---|---|---|
-| `scroll-child-view` | 0.618 ms, 8.83M instructions | 0.068 ms, 0.88M instructions |
-| `scroll-same-view` | 0.599 ms, 8.59M instructions | 0.226 ms, 3.19M instructions |
-| `scroll-uniform-list` | 0.393 ms, 5.35M | 0.399 ms, 5.35M (no list layers) |
-| `scroll-list` | 0.377 ms, 5.09M | 0.384 ms, 5.09M (no list layers) |
+| `scroll-child-view` | 0.619 ms, 8.83M instructions | 0.066 ms, 0.88M instructions |
+| `scroll-same-view` | 0.578 ms, 8.59M instructions | 0.232 ms, 3.19M instructions |
+| `scroll-uniform-list` | 0.397 ms, 5.36M instructions | 0.137 ms, 1.62M instructions |
+| `scroll-list` | 0.377 ms, 5.11M instructions | 0.147 ms, 1.70M instructions |
+
+Every scenario composited its layer on all scrolled frames. In the list
+scenarios the pointer stays over the rows, 40 px of wheel a frame over rows
+about 48 px tall: most frames render one row entering the overscan and two
+whose hover changed, and, scrolling back, one row showing again after it
+left the viewport. Drawn without a layer, each frame renders about 20.
 
 GPUI Kit's Button story, measured before the overscan was raised to two
 viewports, at 145 Hz, with one wheel event per frame, over two 12-second runs

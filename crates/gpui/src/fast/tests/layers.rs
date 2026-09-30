@@ -8,7 +8,6 @@ use crate::{
     Underline, decode_layer_tile, fast::layers::scene::translate_primitive, layer_tile_id,
     layer_tile_texture_id, point, px, scene::Primitive, size,
 };
-use std::rc::Rc;
 
 #[test]
 fn layer_tile_ids_round_trip_and_never_collide_with_the_atlas() {
@@ -74,7 +73,7 @@ fn layer(content: Scene) -> LayerFrame {
         generation: 1,
         background: crate::rgba(0xffffffff),
         tile_size: 512,
-        content: Rc::new(content),
+        content: content.into(),
         dirty_tiles: Vec::new(),
     }
 }
@@ -157,6 +156,109 @@ fn a_tile_scene_keeps_layers_sharing_one_draw_order() {
     let t10 = layer.tile_scene(TileCoord { x: 1, y: 0 });
     assert_eq!(t10.quads.len(), 1);
     assert_eq!(t10.quads[0].bounds, sp(600. - 512., 10., 10., 10.));
+}
+
+/// Content handed to the renderer in parts, as a virtual list's rows are,
+/// draws over each tile what it draws handed over as one scene: a part
+/// reaching no pixel of a tile is left out of the tile's scene.
+#[test]
+fn content_in_parts_draws_each_tile_as_one_scene_does() {
+    use crate::fast::layers::{
+        scene::{LayerContent, LayerPart},
+        tiles::part_tile_hashes,
+    };
+    use crate::scene::PaintOperation;
+    use std::rc::Rc;
+
+    let color = |row: usize| crate::hsla(row as f32 / 7., 0.5, 0.5, 1.);
+    // Six rows, 200 px tall and 700 px wide: a background each; in every
+    // other row a layer around two overlapping quads; in row 3 a shadow
+    // blurred into the rows beside it.
+    let rows: Vec<Vec<PaintOperation>> = (0..6)
+        .map(|row| {
+            let y = row as f32 * 200.;
+            let mut operations = vec![PaintOperation::Primitive(
+                Quad {
+                    background: color(row).into(),
+                    ..quad(sp(0., y, 700., 200.))
+                }
+                .into(),
+            )];
+            if row % 2 == 0 {
+                operations.push(PaintOperation::StartLayer(sp(0., y, 700., 200.)));
+                operations.push(PaintOperation::Primitive(
+                    quad(sp(480., y + 50., 60., 60.)).into(),
+                ));
+                operations.push(PaintOperation::Primitive(
+                    Quad {
+                        background: color(row + 1).into(),
+                        ..quad(sp(500., y + 70., 60., 60.))
+                    }
+                    .into(),
+                ));
+                operations.push(PaintOperation::EndLayer);
+            }
+            if row == 3 {
+                operations.push(PaintOperation::Primitive(
+                    Shadow {
+                        order: 0,
+                        blur_radius: ScaledPixels(20.),
+                        bounds: sp(100., y + 150., 300., 40.),
+                        corner_radii: Default::default(),
+                        content_mask: wide_mask(),
+                        color: Hsla::black(),
+                        element_bounds: sp(100., y + 150., 300., 40.),
+                        element_corner_radii: Default::default(),
+                        inset: 0,
+                        pad: 0,
+                    }
+                    .into(),
+                ));
+            }
+            operations
+        })
+        .collect();
+
+    let mut whole = Scene::default();
+    for operation in rows.iter().flatten() {
+        match operation {
+            PaintOperation::Primitive(primitive) => whole.insert_primitive(primitive.clone()),
+            PaintOperation::StartLayer(bounds) => whole.push_layer(*bounds),
+            PaintOperation::EndLayer => whole.pop_layer(),
+        }
+    }
+    whole.finish();
+    let parts = rows.iter().map(|operations| {
+        let (_, reach) = part_tile_hashes(operations, 512);
+        let mut scene = Scene::default();
+        scene.paint_operations = operations
+            .iter()
+            .map(|operation| match operation {
+                PaintOperation::Primitive(primitive) => {
+                    PaintOperation::Primitive(primitive.clone())
+                }
+                PaintOperation::StartLayer(bounds) => PaintOperation::StartLayer(*bounds),
+                PaintOperation::EndLayer => PaintOperation::EndLayer,
+            })
+            .collect();
+        LayerPart {
+            bounds: Some(reach.unwrap_or_default()),
+            scene: Rc::new(scene),
+        }
+    });
+    let whole = layer(whole);
+    let in_parts = LayerFrame {
+        content: LayerContent::from_parts(parts),
+        ..whole.clone()
+    };
+    for y in -1..4 {
+        for x in -1..3 {
+            let tile = TileCoord { x, y };
+            let drawn =
+                |frame: &LayerFrame| crate::fast::layers::verify::drawn(&frame.tile_scene(tile));
+            assert_eq!(drawn(&in_parts), drawn(&whole), "tile {tile:?}");
+        }
+    }
 }
 
 fn atlas_tile() -> AtlasTile {
@@ -780,7 +882,7 @@ mod paint {
             assert_eq!(record.viewport.size.height, crate::px(100.));
             assert_eq!(record.painted_region.origin.y, crate::px(0.));
             assert_eq!(record.painted_region.size.height, crate::px(300.));
-            let rows = row_quads(&record.content, 40);
+            let rows = row_quads(record.content.scene().unwrap(), 40);
             assert_eq!(
                 rows.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
                 (0..15).collect::<Vec<_>>()
@@ -823,7 +925,7 @@ mod paint {
             // Overscan of two viewports above and below the one at 300..400.
             assert_eq!(record.painted_region.origin.y, crate::px(-200.));
             assert_eq!(record.painted_region.size.height, crate::px(500.));
-            let rows = row_quads(&record.content, 40);
+            let rows = row_quads(record.content.scene().unwrap(), 40);
             assert_eq!(
                 rows.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
                 (5..30).collect::<Vec<_>>()
@@ -936,7 +1038,7 @@ mod paint {
                 record.painted_region, record.viewport,
                 "no overscan past the content"
             );
-            assert_eq!(row_quads(&record.content, 3).len(), 3);
+            assert_eq!(row_quads(record.content.scene().unwrap(), 3).len(), 3);
             let region = record.painted_region.scale(window.scale_factor());
             for tile in record.tile_hashes.keys() {
                 let top = tile.y as f32 * 512.;
@@ -1271,7 +1373,7 @@ mod paint {
             assert_eq!(scene.layers.frames.len(), 1);
             let frame = &scene.layers.frames[0];
             assert_eq!(frame.key, layer.key);
-            assert!(std::rc::Rc::ptr_eq(&frame.content, &record.content));
+            assert!(frame.content.ptr_eq(&record.content));
             assert_eq!(frame.generation, record.generation);
             assert_eq!(frame.background, record.background);
             assert_eq!(frame.tile_size, 512);
@@ -1514,7 +1616,10 @@ mod paint {
             let layer = window.fast_layers.layers.values().next().expect("a layer");
             let record = layer.record.as_ref().expect("painted");
             assert!(!record.has_paths);
-            assert!(record.content.paths.is_empty(), "the tiles hold no path");
+            assert!(
+                record.content.scene().unwrap().paths.is_empty(),
+                "the tiles hold no path"
+            );
             assert_eq!(record.paths.len(), 1, "the layer keeps the path apart");
             let scene = &window.rendered_frame.scene;
             assert!(!tile_quads(scene).is_empty(), "the tiles are composited");

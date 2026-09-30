@@ -85,8 +85,8 @@ pub struct LayerFrame {
     pub background: Rgba,
     /// The side of a tile, in device pixels.
     pub tile_size: u32,
-    /// The painted content in content space, finished (sorted).
-    pub content: Rc<Scene>,
+    /// The painted content in content space.
+    pub content: LayerContent,
     /// The tiles whose content changed in this generation.
     pub dirty_tiles: Vec<TileCoord>,
 }
@@ -114,7 +114,7 @@ impl LayerFrame {
             ScaledPixels(-bounds.origin.y.0),
         );
         let mut scene = Scene::default();
-        for operation in &self.content.paint_operations {
+        for operation in self.content.operations_over(bounds) {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     if visible_bounds(primitive).intersects(&bounds) {
@@ -129,6 +129,93 @@ impl LayerFrame {
         }
         scene.finish();
         scene
+    }
+}
+
+/// A layer's content, in content space: one or more parts drawn one after
+/// another. A scrolling `div`'s content is one part, a finished scene; a
+/// virtual list's is one part per row, so that a frame adding or changing
+/// rows hands the renderer the rows it kept as they were, without copying
+/// them.
+#[derive(Clone, Default)]
+pub struct LayerContent {
+    parts: Rc<[LayerPart]>,
+}
+
+/// A part of a layer's content.
+#[derive(Clone)]
+pub(crate) struct LayerPart {
+    /// Where the part's primitives can draw, if known: a tile it misses
+    /// draws nothing of it.
+    pub(crate) bounds: Option<Bounds<ScaledPixels>>,
+    /// The part's paint operations, in drawing order. A row's scene holds
+    /// nothing else.
+    pub(crate) scene: Rc<Scene>,
+}
+
+impl From<Scene> for LayerContent {
+    fn from(scene: Scene) -> Self {
+        Self::from(Rc::new(scene))
+    }
+}
+
+impl From<Rc<Scene>> for LayerContent {
+    fn from(scene: Rc<Scene>) -> Self {
+        LayerContent {
+            parts: Rc::new([LayerPart {
+                bounds: None,
+                scene,
+            }]),
+        }
+    }
+}
+
+impl LayerContent {
+    /// Content made of `parts`, drawn in order.
+    pub(crate) fn from_parts(parts: impl IntoIterator<Item = LayerPart>) -> Self {
+        LayerContent {
+            parts: parts.into_iter().collect(),
+        }
+    }
+
+    /// The content's scene, when it is one part, as a `div`'s is.
+    pub fn scene(&self) -> Option<&Scene> {
+        match &*self.parts {
+            [part] => Some(&part.scene),
+            _ => None,
+        }
+    }
+
+    /// The scenes of the content's parts, in order.
+    #[cfg(test)]
+    pub(crate) fn part_scenes(&self) -> impl Iterator<Item = &Rc<Scene>> {
+        self.parts.iter().map(|part| &part.scene)
+    }
+
+    /// Whether `self` and `other` are the same content, shared.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.parts, &other.parts)
+    }
+
+    /// Every paint operation of the content, in drawing order.
+    pub(crate) fn operations(&self) -> impl Iterator<Item = &PaintOperation> {
+        self.parts
+            .iter()
+            .flat_map(|part| part.scene.paint_operations.iter())
+    }
+
+    /// The paint operations of the parts that can draw over `bounds`, in
+    /// drawing order. Leaving out a part that draws nothing there changes
+    /// no pixel there: a layer it pushed only raises the draw orders of what
+    /// follows, keeping every overlapping pair in order.
+    pub(crate) fn operations_over(
+        &self,
+        bounds: Bounds<ScaledPixels>,
+    ) -> impl Iterator<Item = &PaintOperation> {
+        self.parts
+            .iter()
+            .filter(move |part| part.bounds.is_none_or(|part| part.intersects(&bounds)))
+            .flat_map(|part| part.scene.paint_operations.iter())
     }
 }
 
@@ -148,7 +235,13 @@ fn translate_bounds(
 /// its element's bounds (`vs_shadow`); a mono or subpixel sprite's bounds
 /// are transformed (`to_device_position_transformed`).
 pub(crate) fn visible_bounds(primitive: &Primitive) -> Bounds<ScaledPixels> {
-    let drawn = match primitive {
+    drawn_bounds(primitive).intersect(&primitive.content_mask().bounds)
+}
+
+/// The part of window (or content) space `primitive` can draw into, its
+/// content mask aside. See [`visible_bounds`].
+pub(crate) fn drawn_bounds(primitive: &Primitive) -> Bounds<ScaledPixels> {
+    match primitive {
         Primitive::Shadow(shadow) if shadow.inset != 0 => shadow.element_bounds,
         Primitive::Shadow(shadow) => {
             let margin = ScaledPixels(3. * shadow.blur_radius.0.max(0.));
@@ -170,8 +263,7 @@ pub(crate) fn visible_bounds(primitive: &Primitive) -> Bounds<ScaledPixels> {
             transformed_bounds(sprite.bounds, &sprite.transformation)
         }
         primitive => *primitive.bounds(),
-    };
-    drawn.intersect(&primitive.content_mask().bounds)
+    }
 }
 
 /// The smallest rectangle holding `bounds` transformed by `matrix`.
@@ -212,8 +304,14 @@ fn transformed_bounds(
 /// included, so it draws the same pixels `delta` away.
 pub(crate) fn translate_primitive(primitive: &Primitive, delta: Point<ScaledPixels>) -> Primitive {
     let mut primitive = primitive.clone();
+    move_primitive(&mut primitive, delta);
+    primitive
+}
+
+/// Moves `primitive` by `delta`, as [`translate_primitive`] does, in place.
+pub(crate) fn move_primitive(primitive: &mut Primitive, delta: Point<ScaledPixels>) {
     let mv = |bounds: &mut Bounds<ScaledPixels>| *bounds = translate_bounds(*bounds, delta);
-    match &mut primitive {
+    match primitive {
         Primitive::Shadow(shadow) => {
             mv(&mut shadow.bounds);
             mv(&mut shadow.element_bounds);
@@ -254,7 +352,6 @@ pub(crate) fn translate_primitive(primitive: &Primitive, delta: Point<ScaledPixe
             mv(&mut surface.content_mask.bounds);
         }
     }
-    primitive
 }
 
 /// A sprite's transformation applies to window positions (`R·p + t`, see
