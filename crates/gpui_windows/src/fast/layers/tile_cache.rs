@@ -14,9 +14,11 @@ use gpui::{LayerKey, SceneLayers, TileCoord};
 use windows::Win32::Graphics::{
     Direct3D11::{
         D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-        D3D11_BUFFER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-        D3D11_USAGE_IMMUTABLE, ID3D11Buffer, ID3D11Device, ID3D11RenderTargetView,
-        ID3D11ShaderResourceView, ID3D11Texture2D,
+        D3D11_BUFFER_DESC, D3D11_COMPARISON_ALWAYS, D3D11_FILTER_MIN_MAG_MIP_POINT,
+        D3D11_FLOAT32_MAX, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE_ADDRESS_CLAMP,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE, ID3D11Buffer,
+        ID3D11Device, ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView,
+        ID3D11Texture2D,
     },
     Dxgi::Common::DXGI_SAMPLE_DESC,
 };
@@ -43,6 +45,11 @@ pub(crate) struct TileCache {
     budget_bytes: u64,
     /// Per tile size: the global parameters tiles are drawn with.
     globals: FxHashMap<u32, Option<ID3D11Buffer>>,
+    /// The sampler tiles are composited with. It takes the nearest texel, so
+    /// a fragment copies its tile pixel exactly even when the interpolated
+    /// texture coordinate lands a hair off the texel center, where a linear
+    /// filter would blend in a neighbour.
+    sampler: Option<ID3D11SamplerState>,
 }
 
 impl Default for TileCache {
@@ -54,6 +61,7 @@ impl Default for TileCache {
             frame: 0,
             budget_bytes: DEFAULT_BUDGET_BYTES,
             globals: FxHashMap::default(),
+            sampler: None,
         }
     }
 }
@@ -286,6 +294,7 @@ impl TileCache {
         self.layers.clear();
         self.pool.clear();
         self.globals.clear();
+        self.sampler = None;
     }
 
     /// Gives every tile in `planned` a texture, fits the cache in its
@@ -296,6 +305,9 @@ impl TileCache {
         layers: &SceneLayers,
         planned: &[(usize, TileCoord)],
     ) -> Result<()> {
+        if self.sampler.is_none() {
+            self.sampler = create_point_sampler(device)?;
+        }
         self.evict_to_budget(self.budget_bytes);
         for &(index, coord) in planned {
             let layer = &layers.frames[index];
@@ -373,6 +385,32 @@ pub(crate) fn create_globals(
 
 /// A `size` × `size` texture of the frame's format that can be drawn into
 /// and sampled.
+impl TileCache {
+    /// The sampler tiles are composited with. Composited tiles were
+    /// rasterized since the cache was last cleared, which made it.
+    pub(crate) fn sampler(&self) -> &Option<ID3D11SamplerState> {
+        &self.sampler
+    }
+}
+
+fn create_point_sampler(device: &ID3D11Device) -> Result<Option<ID3D11SamplerState>> {
+    let desc = D3D11_SAMPLER_DESC {
+        Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+        AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+        AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+        BorderColor: [0.0; 4],
+        MinLOD: 0.0,
+        MaxLOD: D3D11_FLOAT32_MAX,
+    };
+    let mut sampler = None;
+    unsafe { device.CreateSamplerState(&desc, Some(&mut sampler))? };
+    Ok(sampler)
+}
+
 pub(crate) fn create_tile_texture(device: &ID3D11Device, size: u32) -> Result<TileTexture> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: size,

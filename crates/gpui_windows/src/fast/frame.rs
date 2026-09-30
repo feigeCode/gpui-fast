@@ -213,7 +213,10 @@ pub(crate) fn draw_scene(
                         return Ok(());
                     };
                     let pipeline = &pipelines.poly_sprites;
-                    draw.instances(pipeline, run.start, run.len(), Some(view))
+                    let sampler = std::mem::replace(&mut draw.sampler, layers.sampler());
+                    let drawn = draw.instances(pipeline, run.start, run.len(), Some(view));
+                    draw.sampler = sampler;
+                    drawn
                 })
             }
             PrimitiveBatch::PolychromeSprites { texture_id, range } => {
