@@ -94,6 +94,10 @@ pub(crate) struct LayerRows {
     measured: Option<Measured>,
     /// The layer's translation in the last frame that drew its rows.
     last_translation: Option<Point<ScaledPixels>>,
+    /// How many viewports' height of rows a `list`'s layer holds on each side
+    /// of the rows it shows, up to [`paint::OVERSCAN_VIEWPORTS`]. See
+    /// [`overscan_reach`].
+    reach: f32,
     /// The rows the list showed in the last frame that drew it, and that
     /// frame: the rows whose element states it kept alive, as a list
     /// without a layer does. See [`sort_rows`].
@@ -158,6 +162,30 @@ impl LayerRows {
 /// How many times the rows a list's layer is to hold its frames that keep
 /// rows may add before its rows are painted afresh.
 const REPAINT_AFTER_ADDED: usize = 4;
+
+/// How many viewports' height of rows a frame that keeps a `list`'s rows may
+/// add to the overscan on each side, growing it back after a repaint.
+const REACH_STEP_VIEWPORTS: f32 = 0.5;
+
+/// How many viewports' height of rows on each side of those it shows a
+/// `list`'s layer is to hold after a frame in `mode`, having held `reach`
+/// before, `had_record` whether it held any.
+///
+/// The first frame painting the layer paints the whole overscan, which the
+/// frames compositing it pay back. A frame painting it afresh after that,
+/// for a change of its content, paints only the rows the list shows, as the
+/// list does without a layer: a view holding the list that is notified now
+/// and then, as a chat transcript is when it reaches its end, would
+/// otherwise rebuild five viewports of rows each time, and its layer be
+/// demoted for those spikes (see [`crate::fast::layers::work`]). The frames
+/// keeping the rows after it grow the overscan back a step at a time.
+fn overscan_reach(mode: Mode, reach: f32, had_record: bool) -> f32 {
+    match mode {
+        Mode::Extend => (reach + REACH_STEP_VIEWPORTS).min(paint::OVERSCAN_VIEWPORTS),
+        Mode::Repaint if had_record => 0.,
+        Mode::Repaint => paint::OVERSCAN_VIEWPORTS,
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -1175,6 +1203,7 @@ pub(crate) fn begin_list(
     let viewport = window.content_mask().bounds.intersect(&bounds);
     let scroll_top = state.scroll_top(&state.logical_scroll_top());
     let scroll_offset = paint::snap_scroll_offset(window, point(px(0.), -scroll_top));
+    invalidate::note_list_at_end(window, &version, scrolled_to_end(state));
     // A list lays out its rows itself, and is not taken for changed when a
     // row is measured for the first time: its rows are checked where they
     // are placed.
@@ -1225,6 +1254,42 @@ pub(crate) fn begin_list(
     if mode == Mode::Extend {
         keep_reads(window, cx, &id);
     }
+}
+
+/// Notes that whether the `list` of `state` is scrolled to its end was read,
+/// as [`crate::ListState::is_scrolled_to_end`] reads it, and what it was (see
+/// [`invalidate::note_at_end_read`]).
+pub(crate) fn note_at_end_read(state: &crate::StateInner) {
+    invalidate::note_at_end_read(&state.version, scrolled_to_end(state));
+}
+
+/// Marks the state of a `list` changed if scrolling it to its end moves it.
+/// A view that keeps its list at its end calls
+/// [`crate::ListState::scroll_to_end`] every time it renders, which changes
+/// nothing once the list is there, though laying the list out puts its
+/// offset in other terms.
+pub(crate) fn note_scrolled_to_end(state: &crate::StateInner) {
+    let there = state.pending_scroll.is_none() && scrolled_to_end(state) == Some(true);
+    state.version.bump_if(!there);
+}
+
+/// Whether the `list` of `state` is scrolled to its end, or `None` if it
+/// cannot scroll or the height of a row is not known yet, as
+/// [`crate::ListState::is_scrolled_to_end`] answers.
+pub(crate) fn scrolled_to_end(state: &crate::StateInner) -> Option<bool> {
+    let bounds = state.last_layout_bounds?;
+    let summary = state.items.summary();
+    if summary.has_unknown_height {
+        return None;
+    }
+    let padding = state.last_padding.unwrap_or_default();
+    let content_height = summary.height + padding.top + padding.bottom;
+    let scroll_max = (content_height - bounds.size.height).max(px(0.));
+    if scroll_max <= px(0.) {
+        return None;
+    }
+    let scroll_top = state.scroll_top(&state.logical_scroll_top());
+    Some(scroll_top >= scroll_max)
 }
 
 /// Whether a `list`, whose state `version` counts changes of, laying out the
@@ -1447,8 +1512,16 @@ pub(crate) fn end_list(
     let frame_translation = translation.unwrap_or_default();
     frame.translation = frame_translation;
 
-    // The rows shown and two viewports' height of rows on each side.
-    let extent = viewport.size.height * paint::OVERSCAN_VIEWPORTS;
+    // The rows shown and up to two viewports' height of rows on each side.
+    let layer = window.fast_layers.layers.get_mut(&id).unwrap();
+    let mode = layer
+        .rows
+        .frame
+        .as_ref()
+        .map_or(Mode::Repaint, |frame| frame.mode);
+    let reach = overscan_reach(mode, layer.rows.reach, layer.record.is_some());
+    layer.rows.reach = reach;
+    let extent = viewport.size.height * reach;
     let (top, bottom) = (viewport.top() - extent, viewport.bottom() + extent);
     let available = crate::size(
         AvailableSpace::Definite(bounds.size.width),

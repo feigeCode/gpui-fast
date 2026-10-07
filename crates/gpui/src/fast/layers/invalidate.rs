@@ -68,6 +68,10 @@ pub(crate) struct ScrollLog {
     /// How many times a wheel listener notified each view since the last
     /// frame was drawn, for having scrolled a container it painted.
     scroll_notifies: FxHashMap<EntityId, u64>,
+    /// Whether each list about to be laid out this frame, by the address of
+    /// its state's version counter, is scrolled to its end, for the reads of
+    /// only that to be judged by it. See [`note_at_end_read`].
+    list_ends: FxHashMap<usize, Option<bool>>,
     /// The views that asked for an animation frame while this frame was
     /// being drawn, and while the last one was. See [`note_animation_frame`].
     animation_frames: RefCell<FxHashSet<EntityId>>,
@@ -147,6 +151,7 @@ impl ScrollLog {
         self.scrolled.clear();
         self.scrolled_sources.clear();
         self.scroll_notifies.clear();
+        self.list_ends.clear();
         self.animation_frames_before = std::mem::take(self.animation_frames.get_mut());
         self.anchored.clear();
         self.containers
@@ -278,7 +283,25 @@ pub(crate) fn scrolled(window: &Window, id: &GlobalElementId) -> bool {
 #[derive(Default)]
 struct OffsetReadLog {
     recordings: usize,
-    reads: Vec<(StateVersion, u64)>,
+    reads: Vec<OffsetRead>,
+}
+
+/// A read of a scroll state's offset, and the version of the state it was
+/// read at.
+#[derive(Clone)]
+pub(crate) struct OffsetRead {
+    version: StateVersion,
+    read_at: u64,
+    read: Read,
+}
+
+/// What was read of an offset.
+#[derive(Clone, Copy, PartialEq)]
+enum Read {
+    /// The offset, or anything that moves with it.
+    Offset,
+    /// Only whether a list is scrolled to its end, and what that was.
+    AtEnd(Option<bool>),
 }
 
 thread_local! {
@@ -303,14 +326,44 @@ pub(crate) fn offset_set(version: &StateVersion, moved: bool) {
 /// state `version` counts changes of was read.
 #[inline]
 pub(crate) fn note_offset_read(version: &StateVersion) {
+    note_read(version, Read::Offset);
+}
+
+/// Records, for any recording that is open, that whether the list whose
+/// state `version` counts changes of is scrolled to its end was read, and
+/// was `at_end`: what read only that is unchanged by a scroll after which
+/// the list is as much at its end as it was, as a "back to bottom" button
+/// beside a transcript is.
+#[inline]
+pub(crate) fn note_at_end_read(version: &StateVersion, at_end: Option<bool>) {
+    note_read(version, Read::AtEnd(at_end));
+}
+
+#[inline]
+fn note_read(version: &StateVersion, read: Read) {
     if !COMPILED {
         return;
     }
     OFFSET_READS.with_borrow_mut(|log| {
         if log.recordings > 0 {
-            log.reads.push((version.clone(), version.get()));
+            log.reads.push(OffsetRead {
+                version: version.clone(),
+                read_at: version.get(),
+                read,
+            });
         }
     });
+}
+
+/// Notes whether the list whose state `version` counts changes of, about to
+/// be laid out, is scrolled to its end, for what read only that to be told
+/// apart from what read its offset while its layer is decided on.
+pub(crate) fn note_list_at_end(window: &mut Window, version: &StateVersion, at_end: Option<bool>) {
+    window
+        .fast_layers
+        .scrolls
+        .list_ends
+        .insert(version.id(), at_end);
 }
 
 /// Opens a recording of offset reads, returning where in the log it starts.
@@ -380,27 +433,32 @@ pub(crate) fn replay_offset_reads(reads: &OffsetReads) -> Range<usize> {
 
 /// The scroll offsets a retained subtree read, once each, at the earliest
 /// version read. Most subtrees read none, which takes no allocation.
+///
+/// A state read more than one way counts as its offset read, unless every
+/// read only asked whether a list is at its end and got the same answer.
 #[derive(Clone, Default)]
-pub(crate) struct OffsetReads(Option<Rc<[(StateVersion, u64)]>>);
+pub(crate) struct OffsetReads(Option<Rc<[OffsetRead]>>);
 
 impl OffsetReads {
-    fn of(reads: &[(StateVersion, u64)]) -> Self {
+    fn of(reads: &[OffsetRead]) -> Self {
         if reads.is_empty() {
             return OffsetReads(None);
         }
-        let mut unique: Vec<(StateVersion, u64)> = Vec::with_capacity(reads.len());
+        let mut unique: Vec<OffsetRead> = Vec::with_capacity(reads.len());
         for read in reads {
-            if !unique
-                .iter()
-                .any(|(version, _)| version.id() == read.0.id())
+            match unique
+                .iter_mut()
+                .find(|other| other.version.id() == read.version.id())
             {
-                unique.push(read.clone());
+                Some(other) if other.read != read.read => other.read = Read::Offset,
+                Some(_) => {}
+                None => unique.push(read.clone()),
             }
         }
         OffsetReads(Some(unique.into()))
     }
 
-    fn iter(&self) -> impl Iterator<Item = &(StateVersion, u64)> {
+    fn iter(&self) -> impl Iterator<Item = &OffsetRead> {
         self.0.iter().flat_map(|reads| reads.iter())
     }
 
@@ -425,7 +483,7 @@ pub(crate) fn render_read_offset(dependencies: &RenderDependencies, source: &Scr
         ScrollSource::Handle(id) => dependencies
             .offset_reads
             .iter()
-            .any(|(version, _)| version.id() == *id),
+            .any(|read| read.version.id() == *id),
         ScrollSource::Container(_) => false,
     }
 }
@@ -434,14 +492,25 @@ pub(crate) fn render_read_offset(dependencies: &RenderDependencies, source: &Scr
 /// wheel scrolled it since the last frame, or its shared state changed.
 /// A view that read an offset is built again when it scrolls, as it would
 /// be for any other state it read.
+///
+/// A read of only whether a list is scrolled to its end changed when the
+/// list, about to be laid out, is no longer as much at its end. Where that
+/// is not known this frame — the list's layer is not being decided on — it
+/// is taken for a read of the offset.
 pub(crate) fn offset_read_changed(window: &Window, dependencies: &RenderDependencies) -> bool {
     if !COMPILED {
         return false;
     }
-    let scrolled = &window.fast_layers.scrolls.scrolled_sources;
-    dependencies.offset_reads.iter().any(|(version, read_at)| {
-        version.get() != *read_at
-            || (!scrolled.is_empty() && scrolled.contains(&ScrollSource::of_state(version)))
+    let scrolls = &window.fast_layers.scrolls;
+    let scrolled = &scrolls.scrolled_sources;
+    dependencies.offset_reads.iter().any(|read| {
+        if let Read::AtEnd(at_end) = read.read
+            && let Some(now) = scrolls.list_ends.get(&read.version.id())
+        {
+            return *now != at_end;
+        }
+        read.version.get() != read.read_at
+            || (!scrolled.is_empty() && scrolled.contains(&ScrollSource::of_state(&read.version)))
     })
 }
 
