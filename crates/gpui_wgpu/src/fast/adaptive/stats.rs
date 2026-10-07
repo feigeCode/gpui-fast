@@ -133,9 +133,7 @@ impl WindowStats {
             return;
         }
         if self.cpu_frames() + self.gpu_frames > 0 {
-            let line = self.summary(elapsed);
-            log::info!("{line}");
-            eprintln!("{line}");
+            eprintln!("{}", self.summary(elapsed));
         }
         *self = WindowStats {
             period_start: Some(now),
@@ -143,44 +141,44 @@ impl WindowStats {
         };
     }
 
+    /// One line of `key=value` pairs, after `gpui render stats:`, for
+    /// scripts to read: the period's length, frames on each path, the CPU
+    /// frames' pixels and times by presentation mode, the GPU frames'
+    /// CPU-side time, and why frames went to the GPU (`why_<reason>`).
     fn summary(&self, elapsed: Duration) -> String {
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         let mean = |total: Duration, n: u64| if n == 0 { 0.0 } else { ms(total) / n as f64 };
-        let mut reasons = String::new();
-        for reason in GpuReason::ALL {
-            let count = self.gpu_reasons[reason.index()];
-            if count > 0 {
-                reasons.push_str(&format!(" {}={count}", reason.name()));
-            }
-        }
-        let mut cpu = String::new();
+        let cpu_time: Duration = self.cpu.iter().map(|cpu| cpu.time).sum();
+        let mut line = format!(
+            "gpui render stats: secs={:.2} cpu_frames={} gpu_frames={} cpu_px={} \
+             cpu_ms_mean={:.3} gpu_ms_mean={:.3}",
+            elapsed.as_secs_f64(),
+            self.cpu_frames(),
+            self.gpu_frames,
+            self.cpu.iter().map(|cpu| cpu.pixels).sum::<u64>(),
+            mean(cpu_time, self.cpu_frames()),
+            mean(self.gpu_time, self.gpu_timed),
+        );
         for mode in MODES {
             let stats = &self.cpu[mode_index(mode)];
             if stats.frames > 0 {
-                cpu.push_str(&format!(
-                    " {} {} frames, {} px, mean {:.2} ms, max {:.2} ms;",
-                    mode.name(),
+                line.push_str(&format!(
+                    " {name}_n={} {name}_px={} {name}_ms_mean={:.3} {name}_ms_max={:.3}",
                     stats.frames,
                     stats.pixels,
                     mean(stats.time, stats.frames),
                     ms(stats.max),
+                    name = mode.name(),
                 ));
             }
         }
-        format!(
-            "gpui render stats ({:.1}s): cpu {} frames:{} gpu {} frames, mean {:.2} ms \
-             cpu-side; gpu reasons:{}",
-            elapsed.as_secs_f64(),
-            self.cpu_frames(),
-            if cpu.is_empty() { ";" } else { &cpu },
-            self.gpu_frames,
-            mean(self.gpu_time, self.gpu_timed),
-            if reasons.is_empty() {
-                " none"
-            } else {
-                &reasons
-            },
-        )
+        for reason in GpuReason::ALL {
+            let count = self.gpu_reasons[reason.index()];
+            if count > 0 {
+                line.push_str(&format!(" why_{}={count}", reason.name()));
+            }
+        }
+        line
     }
 
     #[cfg(test)]

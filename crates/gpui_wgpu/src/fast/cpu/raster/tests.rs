@@ -327,6 +327,7 @@ impl Harness {
             is_bgr: mode.is_bgr,
             premultiplied_alpha: mode.premultiplied,
             dual_source_blending: mode.dual_source_blending && self.device_dual_source_blending,
+            path_sample_count: 4,
         }
     }
 
@@ -2092,6 +2093,7 @@ fn timings() {
         is_bgr: false,
         premultiplied_alpha: false,
         dual_source_blending: true,
+        path_sample_count: 4,
     };
     eprintln!(
         "scene: {} quads, {} shadows, {} underlines, {} monochrome sprites, {} polychrome sprites",
@@ -2172,7 +2174,7 @@ fn timings() {
 #[test]
 fn scenes_without_surfaces_can_be_drawn() {
     let scene = Scene::default();
-    assert_eq!(super::can_draw(&scene, &[]), Ok(()));
+    assert_eq!(super::can_draw(&scene, &[], &PARAMS_FOR_CAN_DRAW), Ok(()));
 }
 
 /// The GPU converts a fragment to the target's levels by truncating it to 12
@@ -2396,3 +2398,14 @@ fn isolate_differences() {
         eprintln!("{}\n  {primitive}", difference.report("alone"));
     }
 }
+
+#[cfg(test)]
+const PARAMS_FOR_CAN_DRAW: RasterParams = RasterParams {
+    gamma_ratios: [0.; 4],
+    grayscale_enhanced_contrast: 1.,
+    subpixel_enhanced_contrast: 1.,
+    is_bgr: false,
+    premultiplied_alpha: false,
+    dual_source_blending: true,
+    path_sample_count: 4,
+};

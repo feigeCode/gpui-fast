@@ -75,6 +75,9 @@ pub(crate) struct RasterParams {
     /// Whether subpixel sprites are drawn with dual-source blending, as the
     /// GPU renderer does when the adapter supports it.
     pub(crate) dual_source_blending: bool,
+    /// The samples per pixel paths are rasterized with. Only 4 is
+    /// reproduced; other counts make scenes with paths need the GPU.
+    pub(crate) path_sample_count: u32,
 }
 
 /// The pixels of an atlas texture, as they were uploaded.
@@ -96,14 +99,24 @@ pub(crate) trait SpritePixels: Sync {
 pub(crate) enum NeedsGpu {
     /// The scene has surfaces (video frames), which only the GPU samples.
     Surfaces,
+    /// The scene has paths, and the GPU rasterizes them with another sample
+    /// count than the 4 the CPU reproduces.
+    PathSampling,
 }
 
-/// Whether the CPU can draw `scene` inside `regions`.
-pub(crate) fn can_draw(scene: &Scene, _regions: &[Bounds<DevicePixels>]) -> Result<(), NeedsGpu> {
-    if scene.surfaces.is_empty() {
-        Ok(())
-    } else {
+/// Whether the CPU can draw `scene` inside `regions` as the GPU would with
+/// `params`.
+pub(crate) fn can_draw(
+    scene: &Scene,
+    _regions: &[Bounds<DevicePixels>],
+    params: &RasterParams,
+) -> Result<(), NeedsGpu> {
+    if !scene.surfaces.is_empty() {
         Err(NeedsGpu::Surfaces)
+    } else if !scene.paths.is_empty() && params.path_sample_count != 4 {
+        Err(NeedsGpu::PathSampling)
+    } else {
+        Ok(())
     }
 }
 

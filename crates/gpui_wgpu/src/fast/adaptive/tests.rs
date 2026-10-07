@@ -380,6 +380,7 @@ const PARAMS: RasterParams = RasterParams {
     is_bgr: false,
     premultiplied_alpha: false,
     dual_source_blending: true,
+    path_sample_count: 4,
 };
 
 fn scene(number: u64, since: u64, damage: &[Bounds<DevicePixels>]) -> Scene {
@@ -534,7 +535,7 @@ fn presenter_receives_cpu_frames_with_their_region() {
             .adaptive
             .stats
             .summary_for_test()
-            .contains("native 3 frames")
+            .contains("native_n=3 ")
     );
 
     // A composed window's replayed scene is not numbered: GPU, and the next
@@ -791,6 +792,6 @@ fn unavailable_blit_surface_draws_on_gpu_or_skips_the_frame() {
             .adaptive
             .stats
             .summary_for_test()
-            .contains("blit 1 frames")
+            .contains("blit_n=1 ")
     );
 }

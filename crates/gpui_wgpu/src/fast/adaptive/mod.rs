@@ -371,10 +371,14 @@ impl Adaptive {
             always,
         });
         let plan = match decision {
-            Decision::Cpu(plan) => match raster::can_draw(scene, plan.region.rects()) {
+            Decision::Cpu(plan) => match raster::can_draw(scene, plan.region.rects(), params) {
                 Ok(()) => plan,
-                Err(raster::NeedsGpu::Surfaces) => {
-                    return Self::to_gpu(this, scene, everything, GpuReason::Surfaces, now);
+                Err(needs) => {
+                    let reason = match needs {
+                        raster::NeedsGpu::Surfaces => GpuReason::Surfaces,
+                        raster::NeedsGpu::PathSampling => GpuReason::PathSampling,
+                    };
+                    return Self::to_gpu(this, scene, everything, reason, now);
                 }
             },
             Decision::Gpu(reason) => return Self::to_gpu(this, scene, everything, reason, now),
@@ -653,6 +657,7 @@ pub(crate) fn draw(renderer: &mut WgpuRenderer, scene: &Scene) -> Option<bool> {
             premultiplied_alpha: surface_config.alpha_mode
                 == wgpu::CompositeAlphaMode::PreMultiplied,
             dual_source_blending: core.dual_source_blending,
+            path_sample_count: core.rendering_params.path_sample_count,
         };
         let now = Instant::now();
         match present_mode {

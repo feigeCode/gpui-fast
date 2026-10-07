@@ -66,10 +66,13 @@ pub(crate) enum GpuReason {
     PresentFailed,
     /// The surface had no image to blit the CPU frame to.
     SurfaceUnavailable,
+    /// The scene has paths the GPU rasterizes with a sample count the CPU
+    /// does not reproduce.
+    PathSampling,
 }
 
 impl GpuReason {
-    pub(crate) const ALL: [GpuReason; 10] = [
+    pub(crate) const ALL: [GpuReason; 11] = [
         GpuReason::Surfaces,
         GpuReason::Composition,
         GpuReason::MissingAtlas,
@@ -80,6 +83,7 @@ impl GpuReason {
         GpuReason::FirstFrame,
         GpuReason::PresentFailed,
         GpuReason::SurfaceUnavailable,
+        GpuReason::PathSampling,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -98,6 +102,7 @@ impl GpuReason {
             GpuReason::FirstFrame => "first_frame",
             GpuReason::PresentFailed => "present_failed",
             GpuReason::SurfaceUnavailable => "surface_unavailable",
+            GpuReason::PathSampling => "path_sampling",
         }
     }
 }
