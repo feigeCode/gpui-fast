@@ -88,6 +88,23 @@ pub struct LayoutStats {
     /// Scroll layers dropped because their content kept changing or their
     /// tiles did not fit the budget.
     pub layers_demoted: u64,
+    /// Scenes whose damage was worked out, one per `Window::draw`.
+    pub damage_frames: u64,
+    /// Of those, the scenes damaged over the whole window: the first, one
+    /// after a resize, or one changing more than half the window.
+    pub full_damage_frames: u64,
+    /// Device pixels the scenes' damage covered, added up.
+    pub damaged_pixels: u64,
+    /// Device pixels of the window, added up over the same scenes.
+    pub window_pixels: u64,
+    /// Scenes damaged over at most a sixteenth of the window.
+    pub small_damage_frames: u64,
+    /// Primitives of either scene not drawn the same in the other, added up
+    /// (counted until a scene's damage covers the whole window).
+    pub changed_primitives: u64,
+    /// Time spent working out the damage. Kept only once the stats have been
+    /// reset.
+    pub damage_time: Duration,
 }
 
 /// How long each phase of the frame took, waiting to be folded into the
@@ -226,7 +243,15 @@ impl Window {
     pub fn layout_stats(&self) -> LayoutStats {
         let phases = &self.fast_layout.phase_times;
         let (lines_shaped, shape_time) = self.text_system().shaping_stats();
+        let damage = self.fast_layout.damage.stats();
         LayoutStats {
+            damage_frames: damage.frames,
+            full_damage_frames: damage.full_frames,
+            damaged_pixels: damage.damaged_pixels,
+            window_pixels: damage.window_pixels,
+            small_damage_frames: damage.small_frames,
+            changed_primitives: damage.changed_primitives,
+            damage_time: damage.time,
             build_time: phases.build,
             prepaint_time: phases.prepaint,
             paint_time: phases.paint,
@@ -240,6 +265,7 @@ impl Window {
     #[cfg(any(test, feature = "test-support"))]
     pub fn reset_layout_stats(&mut self) {
         self.fast_layout.phase_times.reset();
+        self.fast_layout.damage.reset_stats();
         self.layout_engine.as_mut().unwrap().reset_stats();
         self.text_system().reset_shaping_stats();
     }
