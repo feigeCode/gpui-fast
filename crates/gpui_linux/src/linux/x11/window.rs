@@ -781,6 +781,7 @@ impl X11WindowState {
             };
 
             renderer.set_subpixel_layout(is_bgr);
+            crate::fast::cpu_present::x11::install(&mut renderer, xcb, x_window, visual.depth);
 
             // Set max window size hints based on the GPU's maximum texture dimension.
             // This prevents the window from being resized larger than what the GPU can render.

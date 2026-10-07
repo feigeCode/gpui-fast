@@ -20,7 +20,7 @@ fn etagere_point_to_device(point: etagere::Point) -> Point<DevicePixels> {
     }
 }
 
-pub struct WgpuAtlas(Mutex<AtlasState<WgpuAtlasTextures>>);
+pub struct WgpuAtlas(pub(crate) Mutex<AtlasState<WgpuAtlasTextures>>);
 
 struct PendingUpload {
     id: AtlasTextureId,
@@ -28,7 +28,7 @@ struct PendingUpload {
     data: Vec<u8>,
 }
 
-struct WgpuAtlasTextures {
+pub(crate) struct WgpuAtlasTextures {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     max_texture_size: u32,
@@ -36,6 +36,7 @@ struct WgpuAtlasTextures {
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
+    pub(crate) fast_cpu: crate::fast::cpu::atlas::AtlasMirror,
 }
 
 pub struct WgpuTextureInfo {
@@ -59,6 +60,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
+            fast_cpu: crate::fast::cpu::atlas::AtlasMirror::default(),
         })))
     }
 
@@ -94,6 +96,7 @@ impl WgpuAtlas {
         self.0.lock().clear(|textures| {
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            crate::fast::cpu::atlas::AtlasMirror::clear(&mut textures.fast_cpu);
         });
     }
 
@@ -106,6 +109,7 @@ impl WgpuAtlas {
             textures.color_texture_format = context.color_texture_format();
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            crate::fast::cpu::atlas::AtlasMirror::clear(&mut textures.fast_cpu);
         });
     }
 }
@@ -146,6 +150,10 @@ impl AtlasBackend for WgpuAtlasTextures {
             texture.allocator.deallocate(tile.tile_id.into());
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
+                crate::fast::cpu::atlas::AtlasMirror::remove_texture(
+                    &mut self.fast_cpu,
+                    texture.id,
+                );
                 self.pending_uploads
                     .retain(|upload| upload.id != texture.id);
                 self.storage[id.kind]
@@ -254,6 +262,12 @@ impl WgpuAtlasTextures {
     }
 
     fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
+        crate::fast::cpu::atlas::AtlasMirror::upload(
+            &mut self.fast_cpu,
+            self.storage.get(id),
+            bounds,
+            bytes,
+        );
         let data = self
             .storage
             .get(id)
@@ -335,11 +349,11 @@ impl WgpuAtlasStorage {
     }
 }
 
-struct WgpuAtlasTexture {
-    id: AtlasTextureId,
+pub(crate) struct WgpuAtlasTexture {
+    pub(crate) id: AtlasTextureId,
     generation: u64,
     allocator: BucketedAtlasAllocator,
-    texture: wgpu::Texture,
+    pub(crate) texture: wgpu::Texture,
     view: wgpu::TextureView,
     format: wgpu::TextureFormat,
     live_atlas_keys: u32,
@@ -361,7 +375,7 @@ impl WgpuAtlasTexture {
         Some(tile)
     }
 
-    fn bytes_per_pixel(&self) -> u8 {
+    pub(crate) fn bytes_per_pixel(&self) -> u8 {
         match self.format {
             wgpu::TextureFormat::R8Unorm => 1,
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm => 4,

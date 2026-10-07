@@ -52,6 +52,7 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
     pub(crate) sort_scratch: crate::fast::scene::SortScratch,
     pub layers: crate::fast::layers::scene::SceneLayers,
+    pub damage: crate::fast::damage::SceneDamage,
 }
 
 #[expect(missing_docs)]

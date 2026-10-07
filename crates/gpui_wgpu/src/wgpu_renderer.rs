@@ -220,8 +220,8 @@ pub(crate) struct WgpuRendererCore {
     pub(crate) instance_data_alignment: u64,
     pub(crate) uses_webgl_instance_data: bool,
     pub(crate) rendering_params: RenderingParameters,
-    is_bgr: bool,
-    dual_source_blending: bool,
+    pub(crate) is_bgr: bool,
+    pub(crate) dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
     pub(crate) target_format: wgpu::TextureFormat,
     max_texture_size: u32,
@@ -230,7 +230,7 @@ pub(crate) struct WgpuRendererCore {
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
 /// device that owns `core`, so it cannot outlive it: there is no surface-only state.
-enum RendererState {
+pub(crate) enum RendererState {
     /// Frames can be drawn.
     Ready {
         surface: wgpu::Surface<'static>,
@@ -251,8 +251,8 @@ pub struct WgpuRenderer {
     /// Compositor GPU hint for adapter selection (unused on WASM).
     #[allow(dead_code)]
     pub(crate) compositor_gpu: Option<CompositorGpuHint>,
-    state: RendererState,
-    surface_config: wgpu::SurfaceConfiguration,
+    pub(crate) state: RendererState,
+    pub(crate) surface_config: wgpu::SurfaceConfiguration,
     pub(crate) atlas: Arc<WgpuAtlas>,
     transparent_alpha_mode: wgpu::CompositeAlphaMode,
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
@@ -263,6 +263,7 @@ pub struct WgpuRenderer {
     observed_error_generation: u64,
     last_surface_error: Option<String>,
     needs_redraw: bool,
+    pub(crate) fast_adaptive: crate::fast::adaptive::Adaptive,
 }
 
 impl WgpuRenderer {
@@ -479,6 +480,7 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            fast_adaptive: crate::fast::adaptive::Adaptive::default(),
         })
     }
 }
@@ -1124,6 +1126,9 @@ impl WgpuRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) -> bool {
+        if let Some(drawn) = crate::fast::adaptive::draw(self, scene) {
+            return drawn;
+        }
         #[cfg(target_family = "wasm")]
         if self.device_lost() {
             if matches!(self.state, RendererState::Ready { .. }) {
@@ -1211,6 +1216,7 @@ impl WgpuRenderer {
             return false;
         }
 
+        crate::fast::adaptive::Adaptive::gpu_drew(&mut self.fast_adaptive, scene);
         frame.present();
         true
     }

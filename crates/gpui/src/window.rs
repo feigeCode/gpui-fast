@@ -3461,6 +3461,7 @@ impl Window {
         crate::fast::global_id::GlobalIdCache::finish_frame(&mut self.global_ids);
         crate::fast::retained::finish_retained_frame(self);
         self.next_frame.finish(&mut self.rendered_frame);
+        crate::fast::damage::finish_frame(self);
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();

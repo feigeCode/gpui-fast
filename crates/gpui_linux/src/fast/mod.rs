@@ -8,3 +8,5 @@
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) mod composition;
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(crate) mod cpu_present;
