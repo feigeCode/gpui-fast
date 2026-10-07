@@ -11,7 +11,10 @@ use crate::fast::adaptive::policy::{
     AtlasDamage, CANVAS_RELEASE_AFTER, CpuPlan, Decision, Frame, GpuReason, Policy, Target,
 };
 use crate::fast::adaptive::region::{Region, rect, whole};
-use crate::fast::adaptive::{Adaptive, Mode, stats};
+use crate::fast::adaptive::{
+    Adaptive, MAX_PRESENT_FAILURES, Mode, Output, Prepared, PresentMode, cpu_frames_possible,
+    default_present_mode, present_mode, stats,
+};
 use crate::fast::cpu::atlas::AtlasMirror;
 use crate::fast::cpu::raster::RasterParams;
 use crate::fast::cpu::{CpuFrame, CpuPresenter};
@@ -70,9 +73,17 @@ fn gpu(decision: Decision) -> GpuReason {
     }
 }
 
-/// A policy whose canvas shows scene 1, drawn whole at `t0`, done 5 ms later.
+/// A policy whose canvas shows scene 1, drawn by the GPU 200 ms before `t0`
+/// (the first frame always is), then whole on the CPU at `t0`, done 5 ms
+/// later.
 fn with_canvas(t0: Instant) -> Policy {
     let mut policy = Policy::default();
+    let before = t0 - ms(200);
+    assert_eq!(
+        gpu(policy.decide(&frame(before, 1, 0, &[]))),
+        GpuReason::FirstFrame
+    );
+    assert!(!policy.gpu_drew(before, 1, 0, &[], AtlasDamage::Rects(&[])));
     let plan = cpu(policy.decide(&frame(t0, 1, 0, &[])));
     assert!(plan.whole);
     assert_eq!(plan.region.rects(), &[TARGET.bounds()]);
@@ -113,7 +124,6 @@ fn large_damage_in_burst_draws_on_gpu_and_small_damage_after_on_cpu() {
     let plan = cpu(policy.decide(&frame(now + ms(10), 3, 2, &small)));
     assert_eq!(sorted(plan.region.rects()), region(&[large[0], small[0]]));
     assert_eq!(plan.changed, 100);
-    assert!(policy.take_gpu_presented());
 }
 
 #[test]
@@ -281,6 +291,10 @@ fn limits_and_always() {
     let mut policy = Policy::default();
     let mut input = frame(t0, 1, 0, &[]);
     input.target = big;
+    input.always = true;
+    assert_eq!(gpu(policy.decide(&input)), GpuReason::FirstFrame);
+    policy.gpu_drew(t0 - ms(200), 1, 0, &[], AtlasDamage::Rects(&[]));
+    input.always = false;
     assert_eq!(gpu(policy.decide(&input)), GpuReason::TooLarge);
     input.always = true;
     assert!(cpu(policy.decide(&input)).whole);
@@ -300,12 +314,38 @@ fn half_window_region_draws_whole() {
     assert!(plan.whole);
 }
 
+/// What a presenter was asked, in order, with the swapchain presents of GPU
+/// frames (which the renderer does right after `Adaptive::gpu_drew`).
+#[derive(Clone, Debug, PartialEq)]
+enum Event {
+    Present(Vec<Bounds<DevicePixels>>),
+    Refused,
+    GpuPresented,
+    Released,
+    SwapchainPresent,
+}
+
 #[derive(Default)]
 struct Log {
-    frames: Vec<(u32, u32, Vec<Bounds<DevicePixels>>, bool)>,
-    gpu_presented: usize,
-    released: usize,
-    fail: bool,
+    events: Vec<Event>,
+    /// Frames to refuse before presenting again.
+    refuse: u32,
+}
+
+impl Log {
+    fn presented(&self) -> Vec<Vec<Bounds<DevicePixels>>> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Present(damage) => Some(sorted(damage)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn count(&self, wanted: &Event) -> usize {
+        self.events.iter().filter(|event| *event == wanted).count()
+    }
 }
 
 struct FakePresenter(Rc<RefCell<Log>>);
@@ -313,23 +353,23 @@ struct FakePresenter(Rc<RefCell<Log>>);
 impl CpuPresenter for FakePresenter {
     fn present(&mut self, frame: CpuFrame<'_>) -> anyhow::Result<()> {
         let mut log = self.0.borrow_mut();
-        anyhow::ensure!(!log.fail, "presenter failed");
         assert_eq!(frame.pixels.len(), (frame.width * frame.height) as usize);
-        log.frames.push((
-            frame.width,
-            frame.height,
-            frame.damage.to_vec(),
-            frame.opaque,
-        ));
+        assert!(frame.opaque);
+        if log.refuse > 0 {
+            log.refuse -= 1;
+            log.events.push(Event::Refused);
+            anyhow::bail!("presenter refused the frame");
+        }
+        log.events.push(Event::Present(frame.damage.to_vec()));
         Ok(())
     }
 
     fn gpu_presented(&mut self) {
-        self.0.borrow_mut().gpu_presented += 1;
+        self.0.borrow_mut().events.push(Event::GpuPresented);
     }
 
     fn release(&mut self) {
-        self.0.borrow_mut().released += 1;
+        self.0.borrow_mut().events.push(Event::Released);
     }
 }
 
@@ -363,33 +403,75 @@ fn scaled(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
     }
 }
 
-fn installed(mirror: &mut AtlasMirror) -> (Adaptive, Rc<RefCell<Log>>) {
-    let log = Rc::new(RefCell::new(Log::default()));
-    let mut adaptive = Adaptive {
-        mode: Some(Mode::Auto),
-        ..Adaptive::default()
-    };
-    Adaptive::install(&mut adaptive, Box::new(FakePresenter(log.clone())), mirror);
-    (adaptive, log)
+/// A renderer's adaptive state with a fake presenter, resolved to show CPU
+/// frames with it.
+struct Window {
+    adaptive: Adaptive,
+    mirror: AtlasMirror,
+    log: Rc<RefCell<Log>>,
+}
+
+impl Window {
+    fn new() -> Self {
+        let mut mirror = AtlasMirror::default();
+        AtlasMirror::enable(&mut mirror);
+        let log = Rc::new(RefCell::new(Log::default()));
+        let mut adaptive = Adaptive {
+            mode: Some(Mode::Auto),
+            ..Adaptive::default()
+        };
+        Adaptive::install(
+            &mut adaptive,
+            Box::new(FakePresenter(log.clone())),
+            &mut mirror,
+        );
+        adaptive.resolved = Some(Some(PresentMode::Native));
+        Window {
+            adaptive,
+            mirror,
+            log,
+        }
+    }
+
+    /// Draws `scene` at `now` as `WgpuRenderer::draw` does: on the CPU, or
+    /// on the GPU, presented 2 ms later right after `gpu_drew`.
+    fn draw(&mut self, scene: &Scene, now: Instant) -> bool {
+        let drawn = Adaptive::frame_native(
+            &mut self.adaptive,
+            scene,
+            &mut self.mirror,
+            TARGET,
+            &PARAMS,
+            now,
+        );
+        match drawn {
+            Some(presented) => {
+                assert!(presented);
+                true
+            }
+            None => {
+                if !self.adaptive.disabled {
+                    Adaptive::gpu_drew_at(&mut self.adaptive, scene, now + ms(2));
+                }
+                self.log.borrow_mut().events.push(Event::SwapchainPresent);
+                false
+            }
+        }
+    }
 }
 
 #[test]
 fn presenter_receives_cpu_frames_with_their_region() {
-    let mut mirror = AtlasMirror::default();
-    let (mut adaptive, log) = installed(&mut mirror);
-    assert!(AtlasMirror::is_enabled(&mirror));
+    let mut window = Window::new();
     let totals = stats::totals();
     let t0 = Instant::now();
 
-    // The first frame draws whole.
-    let first = scene(1, 0, &[]);
+    // The first frame draws on the GPU, the next whole on the CPU.
+    assert!(!window.draw(&scene(1, 0, &[]), t0));
+    assert!(window.draw(&scene(2, 1, &[]), t0 + ms(500)));
     assert_eq!(
-        Adaptive::frame(&mut adaptive, &first, &mut mirror, TARGET, &PARAMS, t0),
-        Some(true)
-    );
-    assert_eq!(
-        log.borrow().frames,
-        vec![(1000, 800, vec![whole(1000, 800)], true)]
+        window.log.borrow().presented(),
+        vec![vec![whole(1000, 800)]]
     );
 
     // A glyph rasterized into a tile the scene's sprite samples is redrawn
@@ -399,7 +481,7 @@ fn presenter_receives_cpu_frames_with_their_region() {
         kind: AtlasTextureKind::Monochrome,
     };
     AtlasMirror::upload_raw(
-        &mut mirror,
+        &mut window.mirror,
         texture,
         1024,
         1024,
@@ -408,8 +490,8 @@ fn presenter_receives_cpu_frames_with_their_region() {
         &[255; 16],
     );
     let damage = [rect(0, 0, 10, 10)];
-    let mut second = scene(2, 1, &damage);
-    second.monochrome_sprites.push(MonochromeSprite {
+    let mut third = scene(3, 2, &damage);
+    third.monochrome_sprites.push(MonochromeSprite {
         order: 0,
         pad: 0,
         bounds: scaled(100., 100., 4., 4.),
@@ -425,163 +507,165 @@ fn presenter_receives_cpu_frames_with_their_region() {
         },
         transformation: TransformationMatrix::unit(),
     });
+    assert!(window.draw(&third, t0 + ms(1000)));
     assert_eq!(
-        Adaptive::frame(
-            &mut adaptive,
-            &second,
-            &mut mirror,
-            TARGET,
-            &PARAMS,
-            t0 + ms(500)
-        ),
-        Some(true)
-    );
-    assert_eq!(
-        sorted(&log.borrow().frames[1].2),
+        window.log.borrow().presented()[1],
         vec![rect(0, 0, 10, 10), rect(99, 99, 6, 6)]
     );
 
     // A large change in a burst goes to the GPU; its damage is redrawn by
-    // the next CPU frame, which tells the presenter the GPU presented.
+    // the next CPU frame.
     let large = [rect(0, 0, 400, 400)];
-    let third = scene(3, 2, &large);
-    let now = t0 + ms(510);
-    assert_eq!(
-        Adaptive::frame(&mut adaptive, &third, &mut mirror, TARGET, &PARAMS, now),
-        None
-    );
-    Adaptive::gpu_drew_at(&mut adaptive, &third, now + ms(3));
-    assert_eq!(log.borrow().gpu_presented, 0);
+    let now = t0 + ms(1010);
+    assert!(!window.draw(&scene(4, 3, &large), now));
     let small = [rect(600, 600, 4, 4)];
-    let fourth = scene(4, 3, &small);
-    assert_eq!(
-        Adaptive::frame(
-            &mut adaptive,
-            &fourth,
-            &mut mirror,
-            TARGET,
-            &PARAMS,
-            now + ms(10)
-        ),
-        Some(true)
-    );
-    assert_eq!(log.borrow().gpu_presented, 1);
-    assert_eq!(sorted(&log.borrow().frames[2].2), vec![large[0], small[0]]);
-    let (cpu_frames, gpu_frames, reasons) = adaptive.stats.counts();
-    assert_eq!((cpu_frames, gpu_frames), (3, 1));
+    assert!(window.draw(&scene(5, 4, &small), now + ms(10)));
+    assert_eq!(window.log.borrow().presented()[2], vec![large[0], small[0]]);
+
+    let (cpu_frames, gpu_frames, reasons) = window.adaptive.stats.counts();
+    assert_eq!((cpu_frames, gpu_frames), (3, 2));
     assert_eq!(reasons[GpuReason::LargeChange.index()], 1);
+    assert_eq!(reasons[GpuReason::FirstFrame.index()], 1);
     let after = stats::totals();
     assert!(after.cpu_frames >= totals.cpu_frames + 3);
+    assert!(after.cpu_frames_by_mode[0] >= totals.cpu_frames_by_mode[0] + 3);
     assert!(
-        after.gpu_reasons[GpuReason::LargeChange.index()]
-            > totals.gpu_reasons[GpuReason::LargeChange.index()]
+        window
+            .adaptive
+            .stats
+            .summary_for_test()
+            .contains("native 3 frames")
     );
 
     // A composed window's replayed scene is not numbered: GPU, and the next
     // numbered scene draws whole.
-    let replayed = scene(0, 0, &[]);
-    assert_eq!(
-        Adaptive::frame(
-            &mut adaptive,
-            &replayed,
-            &mut mirror,
-            TARGET,
-            &PARAMS,
-            now + ms(500)
-        ),
-        None
-    );
-    Adaptive::gpu_drew_at(&mut adaptive, &replayed, now + ms(501));
-    let sixth = scene(6, 5, &small);
-    assert_eq!(
-        Adaptive::frame(
-            &mut adaptive,
-            &sixth,
-            &mut mirror,
-            TARGET,
-            &PARAMS,
-            now + ms(1000)
-        ),
-        Some(true)
-    );
-    assert_eq!(log.borrow().frames[3].2, vec![whole(1000, 800)]);
+    assert!(!window.draw(&scene(0, 0, &[]), now + ms(500)));
+    assert!(window.draw(&scene(7, 6, &small), now + ms(1000)));
+    assert_eq!(window.log.borrow().presented()[3], vec![whole(1000, 800)]);
 }
 
 #[test]
-fn present_failure_falls_back_to_gpu_for_good() {
-    let mut mirror = AtlasMirror::default();
-    let (mut adaptive, log) = installed(&mut mirror);
+fn gpu_presented_comes_before_the_swapchain_present() {
+    let mut window = Window::new();
     let t0 = Instant::now();
-    log.borrow_mut().fail = true;
+    let small = [rect(0, 0, 4, 4)];
+    let large = [rect(0, 0, 500, 500)];
+    window.draw(&scene(1, 0, &[]), t0);
+    window.draw(&scene(2, 1, &small), t0 + ms(500));
+    window.draw(&scene(3, 2, &small), t0 + ms(1000));
+    // In a burst: two large changes on the GPU, then a small one on the CPU.
+    window.draw(&scene(4, 3, &large), t0 + ms(1010));
+    window.draw(&scene(5, 4, &large), t0 + ms(1026));
+    window.draw(&scene(6, 5, &small), t0 + ms(1042));
     assert_eq!(
-        Adaptive::frame(
-            &mut adaptive,
-            &scene(1, 0, &[]),
-            &mut mirror,
-            TARGET,
-            &PARAMS,
-            t0
-        ),
-        None
+        window.log.borrow().events,
+        vec![
+            // The first frame, on the GPU, tells the presenter first.
+            Event::GpuPresented,
+            Event::SwapchainPresent,
+            Event::Present(vec![whole(1000, 800)]),
+            Event::Present(small.to_vec()),
+            // Once per switch to the GPU, before its present.
+            Event::GpuPresented,
+            Event::SwapchainPresent,
+            Event::SwapchainPresent,
+            Event::Present(large.to_vec()),
+        ]
     );
-    assert!(!AtlasMirror::is_enabled(&mirror));
-    log.borrow_mut().fail = false;
+}
+
+#[test]
+fn refused_frames_draw_on_gpu_and_keep_the_canvas_consistent() {
+    let mut window = Window::new();
+    let t0 = Instant::now();
+    let a = [rect(0, 0, 4, 4)];
+    let b = [rect(100, 100, 4, 4)];
+    let c = [rect(200, 200, 4, 4)];
+    window.draw(&scene(1, 0, &[]), t0);
+    window.draw(&scene(2, 1, &a), t0 + ms(500));
+    window.log.borrow_mut().refuse = 2;
+    // Refused twice: each frame draws on the GPU, and the presenter, which
+    // showed a CPU frame, is told before the first GPU present.
+    assert!(!window.draw(&scene(3, 2, &b), t0 + ms(1000)));
+    assert!(!window.draw(&scene(4, 3, &c), t0 + ms(1500)));
+    // The next frame redraws what the GPU frames changed.
+    assert!(window.draw(&scene(5, 4, &a), t0 + ms(2000)));
+    let events = window.log.borrow().events.clone();
     assert_eq!(
-        Adaptive::frame(
-            &mut adaptive,
-            &scene(2, 1, &[]),
-            &mut mirror,
-            TARGET,
-            &PARAMS,
-            t0 + ms(500)
-        ),
-        None
+        events[3..events.len() - 1],
+        [
+            Event::Refused,
+            Event::GpuPresented,
+            Event::SwapchainPresent,
+            Event::Refused,
+            Event::SwapchainPresent,
+        ]
     );
-    Adaptive::gpu_drew(&mut adaptive, &scene(2, 1, &[]));
-    assert!(log.borrow().frames.is_empty());
+    assert_eq!(
+        window.log.borrow().presented().last().unwrap(),
+        &sorted(&[a[0], b[0], c[0]])
+    );
+    assert_eq!(
+        window.adaptive.stats.counts().2[GpuReason::PresentFailed.index()],
+        2
+    );
+    assert!(!window.adaptive.disabled);
+}
+
+#[test]
+fn many_refusals_in_a_row_turn_the_cpu_path_off() {
+    let mut window = Window::new();
+    let t0 = Instant::now();
+    window.draw(&scene(1, 0, &[]), t0);
+    window.log.borrow_mut().refuse = u32::MAX;
+    let small = [rect(0, 0, 4, 4)];
+    let mut now = t0;
+    let last = 1 + MAX_PRESENT_FAILURES as u64;
+    for number in 2..=last {
+        now += ms(500);
+        assert!(!window.draw(&scene(number, number - 1, &small), now));
+        assert_eq!(window.adaptive.disabled, number == last);
+    }
+    assert!(!AtlasMirror::is_enabled(&window.mirror));
+    assert_eq!(
+        window.log.borrow().count(&Event::Refused),
+        MAX_PRESENT_FAILURES as usize
+    );
+    // Off for good: no more frames reach the presenter.
+    window.log.borrow_mut().refuse = 0;
+    assert!(!window.draw(&scene(last + 1, last, &small), now + ms(500)));
+    assert!(window.log.borrow().presented().is_empty());
+    assert!(window.adaptive.presenter.is_none());
 }
 
 #[test]
 fn canvas_and_presenter_buffers_released_after_gpu_second() {
-    let mut mirror = AtlasMirror::default();
-    let (mut adaptive, log) = installed(&mut mirror);
+    let mut window = Window::new();
     let t0 = Instant::now();
-    Adaptive::frame(
-        &mut adaptive,
-        &scene(1, 0, &[]),
-        &mut mirror,
-        TARGET,
-        &PARAMS,
-        t0,
-    )
-    .unwrap();
-    assert!(adaptive.canvas.is_some());
+    window.draw(&scene(1, 0, &[]), t0);
+    assert!(window.draw(&scene(2, 1, &[]), t0 + ms(500)));
+    assert!(window.adaptive.canvas.is_some());
     // Animating most of the window, on the GPU.
     let large = [rect(0, 0, 500, 500)];
     for ix in 0..70u64 {
-        let now = t0 + ms(10 + 16 * ix);
-        let number = ix + 2;
-        let frame = scene(number, number - 1, &large);
-        assert_eq!(
-            Adaptive::frame(&mut adaptive, &frame, &mut mirror, TARGET, &PARAMS, now),
-            None
-        );
-        Adaptive::gpu_drew_at(&mut adaptive, &frame, now + ms(2));
+        let number = ix + 3;
+        assert!(!window.draw(&scene(number, number - 1, &large), t0 + ms(510 + 16 * ix)));
     }
-    assert!(adaptive.canvas.is_none());
-    assert_eq!(log.borrow().released, 1);
+    assert!(window.adaptive.canvas.is_none());
+    assert_eq!(window.log.borrow().count(&Event::Released), 1);
 }
 
 #[test]
 fn missing_atlas_textures_need_gpu() {
-    let mut mirror = AtlasMirror::default();
+    let mut window = Window::new();
+    AtlasMirror::disable(&mut window.mirror);
     let texture = AtlasTextureId {
         index: 2,
         kind: AtlasTextureKind::Polychrome,
     };
-    // Uploaded before a presenter was installed.
+    // Uploaded while the mirror was off.
     AtlasMirror::upload_raw(
-        &mut mirror,
+        &mut window.mirror,
         texture,
         1024,
         1024,
@@ -589,9 +673,9 @@ fn missing_atlas_textures_need_gpu() {
         rect(0, 0, 1, 1),
         &[0; 4],
     );
-    let (mut adaptive, _log) = installed(&mut mirror);
-    let mut first = scene(1, 0, &[]);
-    first.polychrome_sprites.push(gpui::PolychromeSprite {
+    AtlasMirror::enable(&mut window.mirror);
+    let mut second = scene(2, 1, &[]);
+    second.polychrome_sprites.push(gpui::PolychromeSprite {
         order: 0,
         pad: 0,
         grayscale: Default::default(),
@@ -609,12 +693,104 @@ fn missing_atlas_textures_need_gpu() {
         },
     });
     let t0 = Instant::now();
+    window.draw(&scene(1, 0, &[]), t0);
+    assert!(!window.draw(&second, t0 + ms(500)));
     assert_eq!(
-        Adaptive::frame(&mut adaptive, &first, &mut mirror, TARGET, &PARAMS, t0),
-        None
-    );
-    assert_eq!(
-        adaptive.stats.counts().2[GpuReason::MissingAtlas.index()],
+        window.adaptive.stats.counts().2[GpuReason::MissingAtlas.index()],
         1
+    );
+}
+
+#[test]
+fn present_modes_resolve_from_the_setting_and_the_presenter() {
+    if !cpu_frames_possible() {
+        return;
+    }
+    let native = Some(PresentMode::Native);
+    let blit = Some(PresentMode::Blit);
+    assert_eq!(present_mode(blit, true), blit);
+    assert_eq!(present_mode(blit, false), blit);
+    assert_eq!(present_mode(native, true), native);
+    assert_eq!(present_mode(native, false), blit);
+    assert_eq!(present_mode(None, true), default_present_mode(true));
+    assert_eq!(present_mode(None, false), default_present_mode(false));
+}
+
+/// An output standing for the blit path's surface.
+struct FakeOutput {
+    prepared: Prepared,
+    shown: Vec<Vec<Bounds<DevicePixels>>>,
+}
+
+impl Output for FakeOutput {
+    fn prepare(&mut self, _target: Target) -> Prepared {
+        self.prepared
+    }
+
+    fn show(&mut self, frame: CpuFrame<'_>) -> anyhow::Result<()> {
+        self.shown.push(frame.damage.to_vec());
+        Ok(())
+    }
+}
+
+fn blit_frame(
+    window: &mut Window,
+    output: &mut FakeOutput,
+    number: u64,
+    now: Instant,
+) -> Option<bool> {
+    Adaptive::frame(
+        &mut window.adaptive,
+        &scene(number, number - 1, &[]),
+        &mut window.mirror,
+        TARGET,
+        &PARAMS,
+        now,
+        output,
+        PresentMode::Blit,
+    )
+}
+
+#[test]
+fn unavailable_blit_surface_draws_on_gpu_or_skips_the_frame() {
+    let mut window = Window::new();
+    window.adaptive.resolved = Some(Some(PresentMode::Blit));
+    window.adaptive.presenter_shows = false;
+    let t0 = Instant::now();
+    let mut output = FakeOutput {
+        prepared: Prepared::Ready,
+        shown: Vec::new(),
+    };
+    assert_eq!(blit_frame(&mut window, &mut output, 1, t0), None);
+    Adaptive::gpu_drew_at(&mut window.adaptive, &scene(1, 0, &[]), t0 + ms(2));
+
+    output.prepared = Prepared::Gpu;
+    assert_eq!(blit_frame(&mut window, &mut output, 2, t0 + ms(500)), None);
+    assert_eq!(
+        window.adaptive.stats.counts().2[GpuReason::SurfaceUnavailable.index()],
+        1
+    );
+    Adaptive::gpu_drew_at(&mut window.adaptive, &scene(2, 1, &[]), t0 + ms(502));
+    output.prepared = Prepared::NotPresented;
+    assert_eq!(
+        blit_frame(&mut window, &mut output, 3, t0 + ms(1000)),
+        Some(false)
+    );
+    output.prepared = Prepared::Ready;
+    // Scene 3 was not shown: scene 4 draws whole.
+    assert_eq!(
+        blit_frame(&mut window, &mut output, 4, t0 + ms(1500)),
+        Some(true)
+    );
+    assert_eq!(output.shown, vec![vec![whole(1000, 800)]]);
+    // The blit path never tells the platform's presenter.
+    Adaptive::gpu_drew_at(&mut window.adaptive, &scene(5, 4, &[]), t0 + ms(2000));
+    assert_eq!(window.log.borrow().count(&Event::GpuPresented), 0);
+    assert!(
+        window
+            .adaptive
+            .stats
+            .summary_for_test()
+            .contains("blit 1 frames")
     );
 }

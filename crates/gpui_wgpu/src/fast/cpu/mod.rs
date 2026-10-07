@@ -31,12 +31,24 @@ pub struct CpuFrame<'a> {
 /// Shows frames drawn on the CPU in a window, without the GPU.
 pub trait CpuPresenter {
     /// Shows `frame`. The window's frame callback, if the platform asked for
-    /// one before drawing, is to be committed with it.
+    /// one before drawing, is to be committed with it. Called for every CPU
+    /// frame, even one with no damage, so that the callback is committed.
+    ///
+    /// An error means the frame was not shown, and the renderer draws it on
+    /// the GPU instead (calling [`CpuPresenter::gpu_presented`] first). A
+    /// presenter may refuse frames for a while (before the GPU presented the
+    /// window's first frame, or while the compositor holds its buffers): the
+    /// renderer stops presenting CPU frames only after many errors in a row.
     fn present(&mut self, frame: CpuFrame<'_>) -> anyhow::Result<()>;
 
-    /// Notes that the GPU presented the frames since the last call to
-    /// `present`: the next frame presented here must be shown whole, not only
-    /// its damage, wherever the platform cannot keep what it last showed.
+    /// Notes that the GPU is about to present a frame after this presenter
+    /// showed one, or before it showed any: called on the GPU frame's path
+    /// right before the swapchain image is presented (`frame.present()`), so
+    /// whatever this does on the window (as hiding a surface over it) is
+    /// applied with the GPU frame. Called once per such switch, and for the
+    /// renderer's first frame, which always draws on the GPU. The next frame
+    /// presented here must be shown whole, not only its damage, wherever the
+    /// platform cannot keep what it last showed.
     fn gpu_presented(&mut self) {}
 
     /// Releases the memory kept for presenting; the next frame is presented

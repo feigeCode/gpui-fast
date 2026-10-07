@@ -5,9 +5,12 @@
 //! inserted. The mirror keeps the same bytes, as uploaded (8-bit coverage for
 //! monochrome textures, BGRA for color textures, before the swizzle the atlas
 //! applies for an RGBA texture format), in a buffer per texture the size of
-//! the texture. It only does so once a renderer that draws on the CPU enabled
-//! it ([`AtlasMirror::enable`]), so that windows that never draw on the CPU
-//! pay nothing.
+//! the texture. A new atlas mirrors from its first upload whenever the
+//! process may draw frames on the CPU (not on the web, not with
+//! `GPUI_CPU_RENDER=0`): the renderer only learns on its first frame whether
+//! it will, after the first frame's glyphs and images were uploaded. A
+//! renderer that will not turns the mirror off then
+//! ([`AtlasMirror::disable`]), freeing the copies.
 //!
 //! The scene diff cannot see atlas content: a texture freed and allocated
 //! again reuses its id, and a tile freed and allocated again to another image
@@ -32,7 +35,6 @@ use crate::wgpu_atlas::WgpuAtlasTexture;
 pub(crate) const MAX_LOGGED_WRITES: usize = 256;
 
 /// A CPU copy of every atlas texture, kept as the atlas uploads to the GPU.
-#[derive(Default)]
 pub(crate) struct AtlasMirror {
     /// Whether uploads are copied. Off until a renderer drawing on the CPU
     /// shares this atlas.
@@ -45,6 +47,18 @@ pub(crate) struct AtlasMirror {
     /// The log overflowed or the atlas was cleared since the last
     /// `take_writes`: every sprite may have changed.
     everything: bool,
+}
+
+impl Default for AtlasMirror {
+    fn default() -> Self {
+        AtlasMirror {
+            enabled: crate::fast::adaptive::cpu_frames_possible(),
+            textures: FxHashMap::default(),
+            missed: FxHashSet::default(),
+            writes: Vec::new(),
+            everything: false,
+        }
+    }
 }
 
 struct MirroredTexture {
@@ -299,6 +313,7 @@ mod tests {
     #[test]
     fn disabled_mirror_copies_nothing_and_notes_missed_textures() {
         let mut mirror = AtlasMirror::default();
+        AtlasMirror::disable(&mut mirror);
         let mono = id(0, AtlasTextureKind::Monochrome);
         AtlasMirror::upload_raw(&mut mirror, mono, 8, 8, 1, rect(0, 0, 1, 1), &[9]);
         assert!(mirror.texture(mono).is_none());

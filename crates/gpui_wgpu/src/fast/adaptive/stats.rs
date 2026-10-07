@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::fast::adaptive::PresentMode;
 use crate::fast::adaptive::policy::GpuReason;
 
 const REASONS: usize = GpuReason::ALL.len();
@@ -18,7 +19,17 @@ fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("GPUI_RENDER_STATS").is_ok_and(|value| value == "1"))
 }
 
+const MODES: [PresentMode; 2] = [PresentMode::Native, PresentMode::Blit];
+
+fn mode_index(mode: PresentMode) -> usize {
+    match mode {
+        PresentMode::Native => 0,
+        PresentMode::Blit => 1,
+    }
+}
+
 static CPU_FRAMES: AtomicU64 = AtomicU64::new(0);
+static CPU_FRAMES_BY_MODE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static GPU_FRAMES: AtomicU64 = AtomicU64::new(0);
 static CPU_PIXELS: AtomicU64 = AtomicU64::new(0);
 static CPU_NANOS: AtomicU64 = AtomicU64::new(0);
@@ -28,6 +39,8 @@ static GPU_REASONS: [AtomicU64; REASONS] = [const { AtomicU64::new(0) }; REASONS
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RenderTotals {
     pub(crate) cpu_frames: u64,
+    /// CPU frames shown natively, and by blit.
+    pub(crate) cpu_frames_by_mode: [u64; 2],
     pub(crate) gpu_frames: u64,
     pub(crate) cpu_pixels: u64,
     pub(crate) cpu_time: Duration,
@@ -40,6 +53,9 @@ pub(crate) struct RenderTotals {
 pub(crate) fn totals() -> RenderTotals {
     RenderTotals {
         cpu_frames: CPU_FRAMES.load(Ordering::Relaxed),
+        cpu_frames_by_mode: std::array::from_fn(|ix| {
+            CPU_FRAMES_BY_MODE[ix].load(Ordering::Relaxed)
+        }),
         gpu_frames: GPU_FRAMES.load(Ordering::Relaxed),
         cpu_pixels: CPU_PIXELS.load(Ordering::Relaxed),
         cpu_time: Duration::from_nanos(CPU_NANOS.load(Ordering::Relaxed)),
@@ -51,10 +67,8 @@ pub(crate) fn totals() -> RenderTotals {
 #[derive(Debug, Default)]
 pub(crate) struct WindowStats {
     period_start: Option<Instant>,
-    cpu_frames: u64,
-    cpu_pixels: u64,
-    cpu_time: Duration,
-    cpu_max: Duration,
+    /// CPU frames by presentation mode (`mode_index`).
+    cpu: [CpuStats; 2],
     gpu_frames: u64,
     /// GPU frames whose CPU-side time was measured, and that time.
     gpu_timed: u64,
@@ -62,17 +76,32 @@ pub(crate) struct WindowStats {
     gpu_reasons: [u64; REASONS],
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct CpuStats {
+    frames: u64,
+    pixels: u64,
+    time: Duration,
+    max: Duration,
+}
+
 impl WindowStats {
-    /// Notes a frame drawn on the CPU, of `pixels`, that took `took`.
-    pub(crate) fn cpu_frame(&mut self, pixels: i64, took: Duration) {
+    /// Notes a frame drawn on the CPU, of `pixels`, shown with `mode`, that
+    /// took `took`.
+    pub(crate) fn cpu_frame(&mut self, mode: PresentMode, pixels: i64, took: Duration) {
         let pixels = pixels.max(0) as u64;
         CPU_FRAMES.fetch_add(1, Ordering::Relaxed);
+        CPU_FRAMES_BY_MODE[mode_index(mode)].fetch_add(1, Ordering::Relaxed);
         CPU_PIXELS.fetch_add(pixels, Ordering::Relaxed);
         CPU_NANOS.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
-        self.cpu_frames += 1;
-        self.cpu_pixels += pixels;
-        self.cpu_time += took;
-        self.cpu_max = self.cpu_max.max(took);
+        let cpu = &mut self.cpu[mode_index(mode)];
+        cpu.frames += 1;
+        cpu.pixels += pixels;
+        cpu.time += took;
+        cpu.max = cpu.max.max(took);
+    }
+
+    fn cpu_frames(&self) -> u64 {
+        self.cpu.iter().map(|cpu| cpu.frames).sum()
     }
 
     /// Notes that a frame goes to the GPU for `reason`.
@@ -103,7 +132,7 @@ impl WindowStats {
         if elapsed < PERIOD {
             return;
         }
-        if self.cpu_frames + self.gpu_frames > 0 {
+        if self.cpu_frames() + self.gpu_frames > 0 {
             let line = self.summary(elapsed);
             log::info!("{line}");
             eprintln!("{line}");
@@ -124,14 +153,26 @@ impl WindowStats {
                 reasons.push_str(&format!(" {}={count}", reason.name()));
             }
         }
+        let mut cpu = String::new();
+        for mode in MODES {
+            let stats = &self.cpu[mode_index(mode)];
+            if stats.frames > 0 {
+                cpu.push_str(&format!(
+                    " {} {} frames, {} px, mean {:.2} ms, max {:.2} ms;",
+                    mode.name(),
+                    stats.frames,
+                    stats.pixels,
+                    mean(stats.time, stats.frames),
+                    ms(stats.max),
+                ));
+            }
+        }
         format!(
-            "gpui render stats ({:.1}s): cpu {} frames, {} px, mean {:.2} ms, max {:.2} ms; \
-             gpu {} frames, mean {:.2} ms cpu-side; gpu reasons:{}",
+            "gpui render stats ({:.1}s): cpu {} frames:{} gpu {} frames, mean {:.2} ms \
+             cpu-side; gpu reasons:{}",
             elapsed.as_secs_f64(),
-            self.cpu_frames,
-            self.cpu_pixels,
-            mean(self.cpu_time, self.cpu_frames),
-            ms(self.cpu_max),
+            self.cpu_frames(),
+            if cpu.is_empty() { ";" } else { &cpu },
             self.gpu_frames,
             mean(self.gpu_time, self.gpu_timed),
             if reasons.is_empty() {
@@ -144,6 +185,11 @@ impl WindowStats {
 
     #[cfg(test)]
     pub(crate) fn counts(&self) -> (u64, u64, [u64; REASONS]) {
-        (self.cpu_frames, self.gpu_frames, self.gpu_reasons)
+        (self.cpu_frames(), self.gpu_frames, self.gpu_reasons)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn summary_for_test(&self) -> String {
+        self.summary(Duration::from_secs(1))
     }
 }

@@ -58,12 +58,18 @@ pub(crate) enum GpuReason {
     WholeInBurst,
     /// The CPU region is larger than [`MAX_CPU_PIXELS`].
     TooLarge,
-    /// Presenting a CPU frame failed; the CPU path is off for good.
+    /// The renderer's first frame: drawn on the GPU whatever it changes, so
+    /// that the window shows a frame of the GPU before any of the CPU's (a
+    /// Wayland window surface has no buffer until then).
+    FirstFrame,
+    /// Presenting the CPU frame failed (the frame was drawn, not shown).
     PresentFailed,
+    /// The surface had no image to blit the CPU frame to.
+    SurfaceUnavailable,
 }
 
 impl GpuReason {
-    pub(crate) const ALL: [GpuReason; 8] = [
+    pub(crate) const ALL: [GpuReason; 10] = [
         GpuReason::Surfaces,
         GpuReason::Composition,
         GpuReason::MissingAtlas,
@@ -71,7 +77,9 @@ impl GpuReason {
         GpuReason::LargeChange,
         GpuReason::WholeInBurst,
         GpuReason::TooLarge,
+        GpuReason::FirstFrame,
         GpuReason::PresentFailed,
+        GpuReason::SurfaceUnavailable,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -87,7 +95,9 @@ impl GpuReason {
             GpuReason::LargeChange => "large_change",
             GpuReason::WholeInBurst => "whole_in_burst",
             GpuReason::TooLarge => "too_large",
+            GpuReason::FirstFrame => "first_frame",
             GpuReason::PresentFailed => "present_failed",
+            GpuReason::SurfaceUnavailable => "surface_unavailable",
         }
     }
 }
@@ -201,10 +211,10 @@ pub(crate) struct Policy {
     cpu_heavy: bool,
     /// When the first GPU frame since the last CPU frame was drawn.
     gpu_since: Option<Instant>,
-    /// The GPU presented frames since the last CPU frame.
-    gpu_presented: bool,
     /// The canvas was released since the last CPU frame.
     released: bool,
+    /// The GPU presented a frame of this renderer.
+    gpu_presented_any: bool,
 }
 
 impl Policy {
@@ -225,6 +235,9 @@ impl Policy {
         }
         if frame.number == 0 {
             return Decision::Gpu(GpuReason::Composition);
+        }
+        if !self.gpu_presented_any {
+            return Decision::Gpu(GpuReason::FirstFrame);
         }
         if self.cpu_heavy && !frame.always {
             return Decision::Gpu(GpuReason::CpuHeavy);
@@ -278,12 +291,6 @@ impl Policy {
         })
     }
 
-    /// Whether the GPU presented frames since the last CPU frame; clears it.
-    /// The presenter is told before the next CPU frame.
-    pub(crate) fn take_gpu_presented(&mut self) -> bool {
-        std::mem::take(&mut self.gpu_presented)
-    }
-
     /// Notes that the CPU drew scene `number` into the canvas of `target`
     /// and presented it, from `start` to `end`, costing `cpu` of CPU time.
     pub(crate) fn cpu_drew(
@@ -319,7 +326,7 @@ impl Policy {
         atlas: AtlasDamage,
     ) -> bool {
         self.last_frame_end = Some(now);
-        self.gpu_presented = true;
+        self.gpu_presented_any = true;
         if let Some(target) = self.canvas {
             let clip = target.bounds();
             let comparable = since != 0 && since == self.last_drawn;
