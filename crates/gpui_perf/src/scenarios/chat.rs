@@ -10,12 +10,18 @@
 //!   toolbar shown on hover — around the message's body, a view of its own
 //!   (`MessageBody`), as a Markdown text view keeps its parsed state in an
 //!   entity: paragraphs with bold, inline code and links, code blocks and
-//!   tables;
+//!   tables. A body shows its first block until it is parsed, which it is
+//!   the frame after it first renders, as Markdown is parsed in the
+//!   background;
 //! - it renders a composer, writing its options into the composer's input
 //!   state every time, as an input component does;
+//! - after building the list, it reads which message the list shows first,
+//!   to mark it in an outline beside the transcript;
 //! - it follows the transcript's end until the wheel scrolls away from it,
 //!   which the list's scroll handler works out in a deferred update of the
 //!   view, notifying it only when that changed;
+//! - it is notified every two seconds for something the transcript does not
+//!   show, as a client's view is by a task it runs;
 //! - in `chat-scroll`, as it renders it asks the list whether it is scrolled
 //!   to its end, to show a "back to bottom" button, which it fades in and
 //!   out a step a frame; `chat-scroll-no-button` has no button, to tell what
@@ -37,6 +43,9 @@ const OVERDRAW: f32 = 2048.;
 const WHEEL_STEP: f32 = 40.;
 /// Frames scrolled in one direction before turning back.
 const FRAMES_PER_SWEEP: usize = 120;
+/// How often the view holding the transcript is notified for something
+/// else, in frames: every two seconds at 60 frames a second.
+const NOTIFY_EVERY_FRAMES: usize = 120;
 
 fn color(hue: f32, saturation: f32, lightness: f32) -> Hsla {
     hsla(hue / 360., saturation, lightness, 1.)
@@ -185,6 +194,9 @@ fn blocks(ix: usize) -> Vec<Block> {
 /// as a Markdown text view holds its state in an entity.
 pub struct MessageBody {
     blocks: Vec<Block>,
+    /// Whether the body rendered, and whether it was parsed since.
+    rendered: bool,
+    parsed: bool,
 }
 
 fn styled_paragraph(text: &SharedString, runs: &[(std::ops::Range<usize>, Style)]) -> StyledText {
@@ -230,6 +242,8 @@ fn styled_paragraph(text: &SharedString, runs: &[(std::ops::Range<usize>, Style)
 
 impl Render for MessageBody {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.rendered = true;
+        let shown = if self.parsed { self.blocks.len() } else { 1 };
         div()
             .flex()
             .flex_col()
@@ -237,7 +251,7 @@ impl Render for MessageBody {
             .text_sm()
             .line_height(px(22.))
             .text_color(text_color())
-            .children(self.blocks.iter().map(|block| {
+            .children(self.blocks.iter().take(shown).map(|block| {
                 match block {
                     Block::Paragraph(text, runs) => {
                         div().child(styled_paragraph(text, runs)).into_any_element()
@@ -321,7 +335,13 @@ impl Transcript {
             });
         });
         let bodies = (0..MESSAGES)
-            .map(|ix| cx.new(|_| MessageBody { blocks: blocks(ix) }))
+            .map(|ix| {
+                cx.new(|_| MessageBody {
+                    blocks: blocks(ix),
+                    rendered: false,
+                    parsed: false,
+                })
+            })
             .collect();
         Self {
             list_state,
@@ -438,15 +458,25 @@ impl Render for Transcript {
             input.placeholder.clone()
         });
         let view = cx.entity().downgrade();
+        let list = list(self.list_state.clone(), move |ix, _, cx| {
+            Self::row(&view, ix, cx)
+        })
+        .size_full();
+        let first_shown = self.list_state.logical_scroll_top().item_ix;
         div()
             .relative()
             .size_full()
             .bg(gpui::white())
+            .child(list)
             .child(
-                list(self.list_state.clone(), move |ix, _, cx| {
-                    Self::row(&view, ix, cx)
-                })
-                .size_full(),
+                div()
+                    .absolute()
+                    .top(px(16. + (first_shown % 40) as f32 * 8.))
+                    .right(px(16.))
+                    .w(px(12.))
+                    .h(px(4.))
+                    .rounded_sm()
+                    .bg(link()),
             )
             .child(
                 div()
@@ -514,7 +544,24 @@ impl Scenario for ChatScroll {
         cx.new(|cx| Transcript::new(back_to_bottom, cx)).into()
     }
 
-    fn step(&self, _: &AnyView, frame: usize, window: &mut Window, cx: &mut App) {
+    fn step(&self, root: &AnyView, frame: usize, window: &mut Window, cx: &mut App) {
+        // The bodies that rendered for the first time are parsed now.
+        if let Ok(transcript) = root.clone().downcast::<Transcript>() {
+            // The view is notified now and then for something the transcript
+            // does not show, as a client's is by a task it runs.
+            if frame % NOTIFY_EVERY_FRAMES == NOTIFY_EVERY_FRAMES / 2 {
+                transcript.update(cx, |_, cx| cx.notify());
+            }
+            let bodies = transcript.read(cx).bodies.clone();
+            for body in bodies {
+                if body.read(cx).rendered && !body.read(cx).parsed {
+                    body.update(cx, |body, cx| {
+                        body.parsed = true;
+                        cx.notify();
+                    });
+                }
+            }
+        }
         window.dispatch_event(wheel(frame), cx);
     }
 }

@@ -284,6 +284,8 @@ pub(crate) fn scrolled(window: &Window, id: &GlobalElementId) -> bool {
 struct OffsetReadLog {
     recordings: usize,
     reads: Vec<OffsetRead>,
+    /// How many times the log was emptied, which starts its positions over.
+    epoch: u64,
 }
 
 /// A read of a scroll state's offset, and the version of the state it was
@@ -309,6 +311,60 @@ thread_local! {
     /// Where offsets that code set live, since [`ScrollLog::take_offsets_set`]
     /// last took them in. Offsets are set without a window to note them in.
     static OFFSETS_SET: RefCell<Vec<ScrollSource>> = const { RefCell::new(Vec::new()) };
+    /// Where the logs of what was read stood when a `list` was last built.
+    /// See [`list_built`].
+    static LIST_BUILT: std::cell::Cell<Option<ListBuilt>> = const { std::cell::Cell::new(None) };
+}
+
+/// Where the logs of what is read while a recording is open stood when a
+/// `list` was built: how many offsets, entities, globals and states they
+/// held, and how many times the offset log, emptied with the others, had
+/// been emptied.
+#[derive(Clone, Copy)]
+pub(crate) struct ListBuilt {
+    epoch: u64,
+    pub(crate) offsets: usize,
+    pub(crate) entities: usize,
+    pub(crate) globals: usize,
+    pub(crate) states: usize,
+}
+
+/// Notes that a `list` is being built, by the render of the view holding it.
+pub(crate) fn note_list_built() {
+    if !COMPILED {
+        return;
+    }
+    let offsets = OFFSET_READS
+        .with_borrow(|log| (log.recordings > 0).then_some((log.epoch, log.reads.len())));
+    let built = offsets
+        .zip(crate::fast::dependencies::read_log_lengths())
+        .map(
+            |((epoch, offsets), (entities, globals, states))| ListBuilt {
+                epoch,
+                offsets,
+                entities,
+                globals,
+                states,
+            },
+        );
+    LIST_BUILT.set(built);
+}
+
+/// Where the logs stood when the last list was built by a render that began
+/// reading offsets at `start` and has read up to `end`, if it built one.
+///
+/// What a view read as it rendered can shape a list it built only if it
+/// read it before building the list: the row renderer a list is handed is
+/// built with it and captures nothing read after, and what its rows read as
+/// they render is theirs. A view reading what its list shows after building
+/// it — an outline beside a transcript showing which of its turns are in
+/// view, an input in a composer below it — does not make the rows depend on
+/// that.
+pub(crate) fn list_built(start: usize, end: usize) -> Option<ListBuilt> {
+    let epoch = OFFSET_READS.with_borrow(|log| log.epoch);
+    LIST_BUILT
+        .get()
+        .filter(|built| built.epoch == epoch && built.offsets >= start && built.offsets <= end)
 }
 
 /// Sets that the scroll state `version` counts changes of moved when
@@ -412,6 +468,7 @@ pub(crate) fn end_offset_reads() {
         log.recordings = log.recordings.saturating_sub(1);
         if log.recordings == 0 {
             log.reads.clear();
+            log.epoch += 1;
         }
     });
 }
@@ -553,7 +610,7 @@ fn owner(window: &Window) -> Option<&GlobalElementId> {
 /// they were recorded, or name an entity notified since the last frame
 /// other than the view holding the container, whose notification
 /// [`owner_notified_otherwise`] accounts for.
-fn changed(
+pub(crate) fn changed(
     window: &Window,
     cx: &App,
     dependencies: &RenderDependencies,
@@ -766,7 +823,7 @@ pub(crate) fn scroll_only(
     !changed(window, cx, &record.dependencies, source.as_ref())
         && window.hovers_unchanged(&record.hovers)
         && !nested_container_scrolled(window, id)
-        && !content_view_notified(window, record)
+        && !content_view_notified(window, id, record)
         && owner_scrolled_only(window, cx, id, source.as_ref())
 }
 
@@ -791,12 +848,23 @@ pub(crate) fn content_views(
 /// is dirty, since the last frame. On frames that composite the layer those
 /// views are neither prepainted nor painted, so the last frame's retained
 /// views and dispatch tree do not hold them: the record remembers them.
-fn content_view_notified(window: &Window, record: &LayerRecord) -> bool {
-    let notified = &window.retained_state.notified_entities;
-    record
-        .views
-        .iter()
-        .any(|view| notified.contains(view) || window.dirty_views.contains(view))
+///
+/// A view drawn in a row a list's layer holds is the row's: a notification
+/// of it renders that row again (see `lists::changed_rows`).
+fn content_view_notified(window: &Window, id: &GlobalElementId, record: &LayerRecord) -> bool {
+    record.views.iter().any(|view| {
+        view_notified(window, *view)
+            && !crate::fast::layers::lists::held_row_view(window, id, *view)
+    })
+}
+
+/// Whether one of `views` was notified, or is dirty, since the last frame.
+pub(crate) fn views_notified(window: &Window, views: &[EntityId]) -> bool {
+    views.iter().any(|view| view_notified(window, *view))
+}
+
+fn view_notified(window: &Window, view: EntityId) -> bool {
+    window.retained_state.notified_entities.contains(&view) || window.dirty_views.contains(&view)
 }
 
 /// Whether a scroll container inside the content of the scroll container
@@ -826,27 +894,65 @@ fn owner_scrolled_only(
     id: &GlobalElementId,
     source: Option<&ScrollSource>,
 ) -> bool {
-    if owner_notified_otherwise(window, id) {
-        return false;
-    }
+    owner_change(window, cx, id, source) == OwnerChange::Scrolled
+}
+
+/// What became of the view holding a scroll container since the last frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnerChange {
+    /// It is as it was, but for scrolls of the container its render did not
+    /// read. See [`owner_scrolled_only`].
+    Scrolled,
+    /// It renders again for a notification or a change of what it read
+    /// itself, which may change what it hands the content, a list's row
+    /// renderer: nothing else changed. See [`owner_rerendered_only`].
+    Rerendered,
+    /// Anything else: a view drawn inside the content is dirty, its render
+    /// read the container's offset, or nothing tells what it read.
+    Changed,
+}
+
+/// What became of the view holding the scroll container `id`, whose offset
+/// lives at `source`, and the views drawn inside the container.
+fn owner_change(
+    window: &Window,
+    cx: &App,
+    id: &GlobalElementId,
+    source: Option<&ScrollSource>,
+) -> OwnerChange {
+    let notified = owner_notified_otherwise(window, id);
     let Some(owner) = owner(window) else {
-        return false;
+        return OwnerChange::Changed;
     };
     let Some(index) = window.rendered_frame.retained.find(owner) else {
         // Not drawn last frame as a retained view: nothing tells what it read.
-        return false;
+        return OwnerChange::Changed;
     };
     let owner = &window.rendered_frame.retained.records[index];
     // A view drawn inside the content renders while the owner lays out,
     // before the content is recorded: what it read is its own record's.
     // One whose view is dirty, notified or around a view that is, is built
     // again.
+    // A view drawn in a row a list's layer holds is the row's (see
+    // `lists::changed_rows`).
     let content_view_dirty = !window.dirty_views.is_empty()
-        && any_content_view(window, id, |view| window.dirty_views.contains(&view));
+        && any_content_view(window, id, |view| {
+            window.dirty_views.contains(&view)
+                && !crate::fast::layers::lists::held_row_view(window, id, view)
+        });
+    // Of what the view read itself, only what its render read can shape the
+    // content: the row renderer a list is handed is built as the view
+    // renders, before the elements it built are laid out, prepainted and
+    // painted and read what they read — an input showing its cursor, say.
+    // What the content itself reads is its record's.
+    let read = owner
+        .render_dependencies
+        .as_ref()
+        .unwrap_or(&owner.own_dependencies);
     // What the view read of itself (a list renders its rows as the view
     // holding it) is judged by how often it was notified, above.
-    let own = without_entity(&owner.own_dependencies, owner_view(window));
-    let own = own.as_ref().unwrap_or(&owner.own_dependencies);
+    let own = without_entity(read, owner_view(window));
+    let own = own.as_ref().unwrap_or(read);
     // What the view writes as it renders again is part of building it.
     let rendering;
     let own = match owner_view(window)
@@ -865,18 +971,43 @@ fn owner_scrolled_only(
     // itself reads is its record's.
     let render_only;
     let own = match &owner.render_offset_reads {
-        Some(reads) => {
+        Some(reads) if owner.render_dependencies.is_none() => {
             render_only = RenderDependencies {
                 offset_reads: reads.clone(),
                 ..own.clone()
             };
             &render_only
         }
-        None => own,
+        _ => own,
     };
-    !content_view_dirty
-        && !source.is_some_and(|source| render_read_offset(own, source))
-        && !changed(window, cx, own, source)
+    if content_view_dirty
+        || source.is_some_and(|source| render_read_offset(own, source))
+        || offset_read_changed(window, own)
+    {
+        OwnerChange::Changed
+    } else if notified || changed(window, cx, own, source) {
+        OwnerChange::Rerendered
+    } else {
+        OwnerChange::Scrolled
+    }
+}
+
+/// Whether the content of the scroll container `id`, whose layer holds
+/// `record`, is as it was but for the view holding it, which renders again
+/// for something it does not tell (see [`OwnerChange::Rerendered`]): only
+/// the content it hands the container anew, a list's rows, may have changed.
+pub(crate) fn owner_rerendered_only(
+    window: &Window,
+    cx: &App,
+    id: &GlobalElementId,
+    record: &LayerRecord,
+) -> bool {
+    let source = window.fast_layers.scrolls.source(id);
+    !changed(window, cx, &record.dependencies, source.as_ref())
+        && window.hovers_unchanged(&record.hovers)
+        && !nested_container_scrolled(window, id)
+        && !content_view_notified(window, id, record)
+        && owner_change(window, cx, id, source.as_ref()) == OwnerChange::Rerendered
 }
 
 /// Whether any view drawn inside the scroll container `id` last frame, as a

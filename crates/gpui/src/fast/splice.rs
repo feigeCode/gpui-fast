@@ -898,6 +898,7 @@ fn copy_record(
         dependencies: record.dependencies.clone(),
         own_dependencies: record.own_dependencies.clone(),
         render_offset_reads: record.render_offset_reads.clone(),
+        render_dependencies: record.render_dependencies.clone(),
         hover_dependencies: record.hover_dependencies.clone(),
         own_hovers: record.own_hovers.clone(),
         layout_keys: record.layout_keys.clone(),

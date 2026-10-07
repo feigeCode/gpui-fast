@@ -84,6 +84,12 @@ pub(crate) struct RetainedSubtree {
     /// container's content included. `None` when it was laid out without
     /// being rendered. See [`crate::fast::layers::invalidate`].
     pub(crate) render_offset_reads: Option<crate::fast::layers::invalidate::OffsetReads>,
+    /// What the subtree's view read itself while its `render` ran, before
+    /// the elements it built were laid out: unlike what they read as they
+    /// are laid out, prepainted or painted, it shapes the closures its render
+    /// handed its elements, such as a list's row renderer. `None` when the
+    /// view was not rendered.
+    pub(crate) render_dependencies: Option<RenderDependencies>,
     /// The hovers the subtree was painted by, nested subtrees included.
     pub(crate) hover_dependencies: Rc<[(HitboxId, bool)]>,
     /// The hovers it was painted by itself, outside nested subtrees.
@@ -147,6 +153,25 @@ pub(crate) struct RetainedLayoutRecording {
     text_style: TextStyle,
     rem_size: Pixels,
     parent_layout_key: Option<u64>,
+    /// What the view read while its `render` ran. See
+    /// [`RetainedLayoutRecording::rendered`].
+    render: Option<RenderDependencies>,
+}
+
+impl RetainedLayoutRecording {
+    /// Notes that the view whose layout request this records has rendered,
+    /// before the elements it built are laid out.
+    pub(crate) fn rendered(&mut self, cx: &mut App) {
+        self.render = Some(cx.dependencies_so_far(&self.dependencies));
+    }
+}
+
+impl RetainedRecording {
+    /// What the view this records the prepaint of read while its `render`
+    /// ran, taken as `render` returns.
+    pub(crate) fn rendered(&self, cx: &mut App) -> RenderDependencies {
+        cx.dependencies_so_far(&self.dependencies)
+    }
 }
 
 /// A retained subtree being prepainted. See [`Window::begin_retained`].
@@ -609,6 +634,7 @@ impl Window {
             text_style: self.text_style(),
             rem_size: self.rem_size(),
             parent_layout_key: self.parent_layout_key(),
+            render: None,
         }
     }
 
@@ -621,7 +647,8 @@ impl Window {
         cx: &mut App,
     ) -> (Option<Rc<RetainedLayout>>, RecordedDependencies) {
         let keys = self.finish_recording_claimed_layout_keys(recording.keys);
-        let dependencies = cx.finish_recording_dependencies(recording.dependencies);
+        let mut dependencies = cx.finish_recording_dependencies(recording.dependencies);
+        dependencies.render = recording.render;
         // A node nothing retains is gone at the end of the frame.
         if self.layout_engine.as_ref().unwrap().transient_count() != recording.transient {
             return (None, dependencies);
@@ -717,6 +744,10 @@ impl Window {
                 dependencies: record.dependencies.written_up_to(writes_now),
                 own_dependencies: record.own_dependencies.written_up_to(writes_now),
                 render_offset_reads: record.render_offset_reads.clone(),
+                render_dependencies: record
+                    .render_dependencies
+                    .as_ref()
+                    .map(|render| render.written_up_to(writes_now)),
                 hover_dependencies: record.hover_dependencies.clone(),
                 own_hovers: record.own_hovers.clone(),
                 layout_keys: record.layout_keys.clone(),
@@ -815,6 +846,7 @@ impl Window {
                 dependencies: RenderDependencies::default(),
                 own_dependencies: RenderDependencies::default(),
                 render_offset_reads: None,
+                render_dependencies: None,
                 hover_dependencies: Rc::new([]),
                 own_hovers: Rc::new([]),
                 layout_keys: Rc::new([]),
@@ -871,6 +903,7 @@ impl Window {
             dependencies = RecordedDependencies {
                 all: layout_dependencies.all.union(&dependencies.all),
                 own: layout_dependencies.own.union(&dependencies.own),
+                render: layout_dependencies.render,
             };
         }
         let context = RetainedContext {
@@ -891,6 +924,7 @@ impl Window {
         record.dependencies = dependencies.all;
         record.own_dependencies = dependencies.own;
         record.render_offset_reads = render_offset_reads;
+        record.render_dependencies = dependencies.render;
         record.layout_keys = layout_keys.into();
         record.layout = layout;
         record.rebuild = rebuild.map(Rc::new);
@@ -1382,13 +1416,14 @@ impl<V: View> ViewElement<V> {
                             return (root, ViewLayout::Spliced(splice));
                         }
                         note_rendering(window, cx, entity_id);
-                        let recording = window.begin_retained_layout(cx);
+                        let mut recording = window.begin_retained_layout(cx);
                         let mut element = self
                             .view
                             .take()
                             .unwrap()
                             .render(window, cx)
                             .into_any_element();
+                        recording.rendered(cx);
                         let layout_id = element.request_layout(window, cx);
                         let retained = window.finish_retained_layout(recording, layout_id, cx);
                         (
@@ -1551,6 +1586,7 @@ impl<V: View> ViewElement<V> {
                             window.reuse_retained_prepaint(previous, false, cx),
                         );
                     }
+                    note_rendering(window, cx, entity_id);
                     let recording = window.begin_retained(global_id, cx);
                     let mut element = self
                         .view
@@ -1558,6 +1594,7 @@ impl<V: View> ViewElement<V> {
                         .unwrap()
                         .render(window, cx)
                         .into_any_element();
+                    let render = recording.rendered(cx);
                     element.layout_as_root(bounds.size.into(), window, cx);
                     element.prepaint_at(bounds.origin, window, cx);
                     // Kept so that the view can be built again on its own
@@ -1576,6 +1613,10 @@ impl<V: View> ViewElement<V> {
                         rebuild,
                         cx,
                     );
+                    if let Some(index) = record {
+                        window.next_frame.retained.records[index].render_dependencies =
+                            Some(render);
+                    }
                     ViewPrepaint::Built { element, record }
                 }
                 ViewLayout::Taken => unreachable!("a view is prepainted once"),
@@ -1620,7 +1661,7 @@ impl<V: View> ViewElement<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> ViewPrepaint {
-        let layout_recording = window.begin_retained_layout(cx);
+        let mut layout_recording = window.begin_retained_layout(cx);
         let changes_before = window.layout_changes();
         let remeasures_before = window.layout_remeasures();
         if let Some(entity_id) = self.entity_id {
@@ -1629,6 +1670,7 @@ impl<V: View> ViewElement<V> {
         let view = self.view.take().unwrap();
         let (mut element, layout_id) = window.with_layout_key_of_prepainting_element(|window| {
             let mut element = view.render(window, cx).into_any_element();
+            layout_recording.rendered(cx);
             let layout_id = element.request_layout(window, cx);
             (element, layout_id)
         });

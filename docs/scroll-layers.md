@@ -105,13 +105,39 @@ build are not enough to trigger this guard.
 Demotion releases cached rows and resets the fixed-size work history. The
 first cooldown requires 60 stable frames; repeated demotions double that wait,
 up to 1920 frames, so periodic refreshes do not keep rebuilding and discarding
-the cache. Updates during cooldown restart its full wait. After 1920 quiet
-frames the backoff resets. This is a work estimate, not a measurement of GPU
+the cache. An update during cooldown asks for 60 more stable frames from it,
+so a view notified every few seconds gets its layer back between
+notifications. A repaint for a change that left every row it painted as the
+layer held it does not count as a changed frame. After 1920 quiet frames the
+backoff resets. This is a work estimate, not a measurement of GPU
 time, and does not depend on the monitor's refresh rate.
 
 Paths are never rasterized into tiles, because odd translations change their
 antialiasing. When nothing covers them, they are drawn over the tiles in the
 frame.
+
+### Changes inside a list's rows
+
+A virtual list's layer keeps what each row read apart from what the list read
+besides (`fast::layers::lists`). While a row renders, is laid out, prepainted
+and painted, the entities it reads are logged under it; the record keeps only
+what the rest of the list read. A frame that finds a row's reads changed, or a
+view drawn in it notified, still composites: it renders that row again, alone,
+as it does a row whose hover changed. A row the list only measured, without
+prepainting it, is not the layer's, and nothing it read is kept.
+
+When the view holding a `list` renders again for something the layer cannot
+tell apart (a notification, a change of what it read itself), it may hand the
+list a different row renderer. The frame still composites: the list renders
+the rows it shows again, and every other row the layer holds is marked suspect
+and rendered again before it shows. A list whose item count changed is
+painted afresh instead, as its rows moved to other indices.
+
+Rows keep their layout nodes: each row the layer holds keeps the keys its
+layout claimed (and only its own, though a `list` lays out every row it shows
+before it prepaints the first), and a row's nodes outlive it for 240 frames
+after it leaves, so scrolling back over it reuses them and the measurements
+they carry instead of shaping its text again.
 
 ## Keeping pixels and coordinates true
 

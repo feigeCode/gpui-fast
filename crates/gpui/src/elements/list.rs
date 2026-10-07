@@ -25,9 +25,10 @@ pub fn list(
     state: ListState,
     render_item: impl FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static,
 ) -> List {
+    crate::fast::layers::invalidate::note_list_built();
     List {
         state,
-        render_item: Box::new(render_item),
+        render_item: crate::fast::layers::lists::spanned_render_item(render_item),
         style: StyleRefinement::default(),
         sizing_behavior: ListSizingBehavior::default(),
     }
