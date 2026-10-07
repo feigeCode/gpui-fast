@@ -26,6 +26,9 @@ pub(crate) struct WindowLayout {
     prepaint_scope: u64,
     /// How long each phase of the frame took. See [`FramePhaseTimes`].
     pub(crate) phase_times: FramePhaseTimes,
+    /// What the window keeps to work out each scene's damage. See
+    /// [`crate::fast::damage`].
+    pub(crate) damage: crate::fast::damage::DamageState,
 }
 
 impl Default for WindowLayout {
@@ -35,6 +38,7 @@ impl Default for WindowLayout {
             root_index: 0,
             prepaint_scope: LAYOUT_ROOT_SEED,
             phase_times: FramePhaseTimes::default(),
+            damage: Default::default(),
         }
     }
 }

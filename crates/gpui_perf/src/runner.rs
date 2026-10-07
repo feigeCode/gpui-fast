@@ -139,6 +139,21 @@ pub struct PhaseAverages {
     pub tiles_dirtied: f64,
     /// Scroll layers painted again before an input event.
     pub layer_rebuilds_for_input: f64,
+    /// The share of the window the scenes' damage covered, from 0 to 1.
+    pub damage_ratio: f64,
+    /// Scenes damaged over at most a sixteenth of the window, in percent of
+    /// the scenes.
+    pub small_damage_pct: f64,
+    /// Scenes damaged over the whole window, in percent of the scenes.
+    pub full_damage_pct: f64,
+    /// Primitives not drawn the same as in the scene before, per frame.
+    pub changed_primitives: f64,
+    /// Time spent working out the damage, per frame.
+    pub damage_ms: f64,
+}
+
+fn percent(part: u64, whole: u64) -> f64 {
+    part as f64 * 100. / whole.max(1) as f64
 }
 
 impl PhaseAverages {
@@ -164,6 +179,11 @@ impl PhaseAverages {
             layer_frames_composited: stats.layer_frames_composited as f64 / n,
             tiles_dirtied: stats.tiles_dirtied as f64 / n,
             layer_rebuilds_for_input: stats.layer_rebuilds_for_input as f64 / n,
+            damage_ratio: stats.damaged_pixels as f64 / stats.window_pixels.max(1) as f64,
+            small_damage_pct: percent(stats.small_damage_frames, stats.damage_frames),
+            full_damage_pct: percent(stats.full_damage_frames, stats.damage_frames),
+            changed_primitives: stats.changed_primitives as f64 / n,
+            damage_ms: ms(stats.damage_time),
         }
     }
 }
@@ -784,7 +804,7 @@ pub fn format_reports(reports: &[ScenarioReport]) -> String {
         let _ = writeln!(out);
 
         type Row = (&'static str, fn(&RunReport) -> f64, usize);
-        let rows: [Row; 25] = [
+        let rows: [Row; 30] = [
             ("frame mean ms", |r| r.frame.mean_ms, 3),
             ("frame p50 ms", |r| r.frame.p50_ms, 3),
             ("frame p95 ms", |r| r.frame.p95_ms, 3),
@@ -815,6 +835,11 @@ pub fn format_reports(reports: &[ScenarioReport]) -> String {
                 |r| r.phases.layer_rebuilds_for_input,
                 2,
             ),
+            ("damaged window share", |r| r.phases.damage_ratio, 4),
+            ("small damage frames %", |r| r.phases.small_damage_pct, 1),
+            ("full damage frames %", |r| r.phases.full_damage_pct, 1),
+            ("changed primitives", |r| r.phases.changed_primitives, 1),
+            ("  damage ms", |r| r.phases.damage_ms, 4),
             ("allocations", |r| r.allocations, 1),
             ("allocated KiB", |r| r.allocated_kib, 1),
             ("step ms (not counted)", |r| r.step.mean_ms, 3),
