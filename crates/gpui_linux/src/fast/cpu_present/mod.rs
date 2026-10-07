@@ -3,6 +3,8 @@
 //!
 //! See `docs/superpowers/specs/2026-10-08-damage-and-adaptive-cpu-design.md`.
 
+mod memfd;
+mod region;
 #[cfg(feature = "wayland")]
 pub(crate) mod wayland;
 #[cfg(feature = "x11")]
