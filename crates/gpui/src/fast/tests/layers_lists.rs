@@ -1088,6 +1088,58 @@ mod list {
         assert_ne!(state.0.borrow().version.get(), version, "it moved");
     }
 
+    /// A [`ListPage`] whose render writes what it was given into a model it
+    /// holds every time, as an input component writes its options into its
+    /// state.
+    struct WritingPage {
+        list: ListPage,
+        options: Entity<bool>,
+    }
+
+    impl Render for WritingPage {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.options.update(cx, |readonly, _| *readonly = true);
+            let rendered = self.list.rendered.clone();
+            div().size_full().bg(rgb(0xffffff)).child(
+                crate::list(self.list.state.clone(), move |row, _, _| {
+                    rendered.borrow_mut().push(row);
+                    div()
+                        .w(px(VIEWPORT_WIDTH))
+                        .h(px(row_height(row)))
+                        .bg(row_color(row))
+                        .into_any_element()
+                })
+                .w(px(VIEWPORT_WIDTH))
+                .h(px(VIEWPORT_HEIGHT)),
+            )
+        }
+    }
+
+    #[crate::test]
+    fn a_view_writing_as_it_renders_keeps_its_list_on_its_layer(cx: &mut TestAppContext) {
+        if !crate::fast::layers::COMPILED {
+            return;
+        }
+        let window = cx.add_window(|_, cx| WritingPage {
+            list: ListPage {
+                state: ListState::new(1000, ListAlignment::Top, px(0.)).measure_all(),
+                rendered: Rc::new(RefCell::new(Vec::new())),
+            },
+            options: cx.new(|_| false),
+        });
+        let window: AnyWindowHandle = window.into();
+        open_at(cx, window, 1.);
+        promote(cx, window);
+        for step in 0..20 {
+            wheel(cx, window, -15.);
+            assert_eq!(
+                decision(cx, window),
+                Some(Decision::Composite),
+                "step {step}"
+            );
+        }
+    }
+
     /// What a view holding a list reads of where the list is scrolled to as
     /// it renders.
     #[derive(Clone, Copy)]

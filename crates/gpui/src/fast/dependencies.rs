@@ -732,6 +732,20 @@ pub(crate) struct Writes {
 }
 
 impl Writes {
+    /// These writes, and those made from `since` to `now` taken for the
+    /// subtree's own.
+    fn with_own(&self, since: u64, now: u64) -> Self {
+        let mut own = self.own.clone();
+        if now > since {
+            own.push((since, now));
+        }
+        Writes {
+            from: self.from,
+            to: self.to,
+            own,
+        }
+    }
+
     /// Whether a write at `written_at` came from outside the subtree after
     /// it began.
     fn is_foreign(&self, written_at: u64) -> bool {
@@ -980,6 +994,16 @@ fn unique_states(states: &[(StateVersion, u64)]) -> Rc<[(StateVersion, u64)]> {
 }
 
 impl RenderDependencies {
+    /// The same dependencies, with the writes made from `since` to `now`
+    /// taken for the subtree's own: those of a view rendering again, which
+    /// are part of building it, as its writes the last time were.
+    pub(crate) fn with_own_writes(&self, since: u64, now: u64) -> Self {
+        Self {
+            writes: self.writes.with_own(since, now),
+            ..self.clone()
+        }
+    }
+
     /// The same dependencies, known to be up to date with every write up to
     /// `writes`: a reused subtree's, checked when it was reused.
     pub(crate) fn written_up_to(&self, writes: u64) -> Self {

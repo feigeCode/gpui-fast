@@ -11,6 +11,8 @@
 //!   (`MessageBody`), as a Markdown text view keeps its parsed state in an
 //!   entity: paragraphs with bold, inline code and links, code blocks and
 //!   tables;
+//! - it renders a composer, writing its options into the composer's input
+//!   state every time, as an input component does;
 //! - it follows the transcript's end until the wheel scrolls away from it,
 //!   which the list's scroll handler works out in a deferred update of the
 //!   view, notifying it only when that changed;
@@ -287,6 +289,15 @@ pub struct Transcript {
     /// shows.
     button_opacity: f32,
     fading: bool,
+    /// The composer's input state, which rendering writes its options into.
+    composer: Entity<ComposerInput>,
+}
+
+/// What an input component keeps of the options it is rendered with.
+#[derive(Default)]
+pub struct ComposerInput {
+    placeholder: SharedString,
+    disabled: bool,
 }
 
 /// How much the "back to bottom" button fades in or out per frame.
@@ -319,6 +330,7 @@ impl Transcript {
             back_to_bottom,
             button_opacity: 0.,
             fading: false,
+            composer: cx.new(|_| ComposerInput::default()),
         }
     }
 
@@ -420,6 +432,11 @@ impl Render for Transcript {
             self.list_state.scroll_to_end();
         }
         self.fade(window, cx);
+        let placeholder = self.composer.update(cx, |input, _| {
+            input.placeholder = "Ask anything...".into();
+            input.disabled = false;
+            input.placeholder.clone()
+        });
         let view = cx.entity().downgrade();
         div()
             .relative()
@@ -430,6 +447,21 @@ impl Render for Transcript {
                     Self::row(&view, ix, cx)
                 })
                 .size_full(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left(px(340.))
+                    .w(px(760.))
+                    .h(px(96.))
+                    .p_3()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(border())
+                    .bg(gpui::white())
+                    .text_color(muted())
+                    .child(placeholder),
             )
             .when(self.button_opacity > 0., |this| {
                 this.child(

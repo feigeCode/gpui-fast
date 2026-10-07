@@ -209,6 +209,10 @@ pub(crate) struct RetainedState {
     /// Room to sort out the layout keys a spliced view keeps, kept from one
     /// splice to the next. See [`crate::fast::splice`].
     pub(crate) splice_keys: FxHashSet<u64>,
+    /// Where in the write generation each view rendered this frame began to
+    /// render: what it writes from then on is part of building it, not a
+    /// change of what it read. See [`note_rendering`].
+    pub(crate) rendering_since: FxHashMap<EntityId, u64>,
 }
 
 impl RetainedState {
@@ -225,6 +229,7 @@ impl RetainedState {
             notified_entities: FxHashSet::default(),
             view_retention: std::env::var("GPUI_VIEW_RETENTION").map_or(true, |value| value != "0"),
             splice_keys: FxHashSet::default(),
+            rendering_since: FxHashMap::default(),
         }
     }
 
@@ -1228,6 +1233,7 @@ pub(crate) fn finish_retained_frame(window: &mut Window) {
         mem::take(&mut window.retained_state.subtrees_dirty_next_frame);
     window.retained_state.hover_dependencies.clear();
     window.retained_state.hover_reads.get_mut().clear();
+    window.retained_state.rendering_since.clear();
     window.next_frame.retained.finish_frame();
     crate::fast::layers::paint::finish_frame(window);
     crate::fast::layers::finish_frame(window);
@@ -1375,6 +1381,7 @@ impl<V: View> ViewElement<V> {
                         {
                             return (root, ViewLayout::Spliced(splice));
                         }
+                        note_rendering(window, cx, entity_id);
                         let recording = window.begin_retained_layout(cx);
                         let mut element = self
                             .view
@@ -1616,6 +1623,9 @@ impl<V: View> ViewElement<V> {
         let layout_recording = window.begin_retained_layout(cx);
         let changes_before = window.layout_changes();
         let remeasures_before = window.layout_remeasures();
+        if let Some(entity_id) = self.entity_id {
+            note_rendering(window, cx, entity_id);
+        }
         let view = self.view.take().unwrap();
         let (mut element, layout_id) = window.with_layout_key_of_prepainting_element(|window| {
             let mut element = view.render(window, cx).into_any_element();
@@ -1654,6 +1664,17 @@ impl<V: View> ViewElement<V> {
         );
         ViewPrepaint::Built { element, record }
     }
+}
+
+/// Notes that the view `entity_id` begins to render, if it has not yet this
+/// frame: see [`RetainedState::rendering_since`].
+fn note_rendering(window: &mut Window, cx: &App, entity_id: EntityId) {
+    let since = cx.entities.write_generation();
+    window
+        .retained_state
+        .rendering_since
+        .entry(entity_id)
+        .or_insert(since);
 }
 
 /// Lays the view out as [`crate::Element::request_layout`] does, drawing it

@@ -847,6 +847,17 @@ fn owner_scrolled_only(
     // holding it) is judged by how often it was notified, above.
     let own = without_entity(&owner.own_dependencies, owner_view(window));
     let own = own.as_ref().unwrap_or(&owner.own_dependencies);
+    // What the view writes as it renders again is part of building it.
+    let rendering;
+    let own = match owner_view(window)
+        .and_then(|view| window.retained_state.rendering_since.get(&view))
+    {
+        Some(since) => {
+            rendering = own.with_own_writes(*since, cx.entities.write_generation());
+            &rendering
+        }
+        None => own,
+    };
     // Of the offsets the view read, only those its render read can shape the
     // content (spec §6.2). What its elements read while prepainted or
     // painted lies outside the content, which a composited frame neither
