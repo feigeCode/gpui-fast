@@ -5,6 +5,7 @@ A performance-focused fork of [Zed's GPUI](https://gpui.rs) with incremental ren
 - **Retained Mode** reuses unchanged views, layout nodes and text measurements.
 - **Scroll layers** reuse cached GPU tiles and list rows while scrolling, on macOS, Linux and Windows.
 - **Window composition** embeds native content while keeping GPUI menus, popovers and dialogs above it.
+- **Adaptive rendering** draws frames that change little on the CPU, only where they change, without waking the GPU's render pipeline (Linux). See [Adaptive rendering](docs/adaptive-rendering.md).
 
 ## Retained Mode
 

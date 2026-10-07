@@ -587,6 +587,27 @@ a tile gets the same noise as one drawn in the window.
 never given a layer, a hover change repaints every held row, and adding rows
 rebuilds the whole content. Lists need per-row records for layers to pay off.
 
+## Pixels: damage and drawing on the CPU
+
+Everything above reduces the work of building a frame. The frame still had to
+be drawn: a whole-window render pass on the GPU, however few pixels changed.
+Two mechanisms carry the incremental frame down to the pixels
+([`adaptive-rendering.md`](adaptive-rendering.md) is the reference):
+
+- **Scene damage.** Each finished scene carries where it can draw different
+  pixels than the scene before it, worked out by diffing the two scenes one
+  draw order at a time (`fast/damage.rs`). It is exact for the same reason a
+  retained frame is correct: a pixel is a function of the primitives covering
+  it, in drawing order, and outside the damage those are the same.
+- **Adaptive CPU rendering.** On the wgpu renderer, a frame whose damage is
+  small is drawn on the CPU, inside its damage only, into a frame kept in
+  memory, and shown without drawing the scene on the GPU (`wl_shm` on
+  Wayland, `PutImage` on X11, or a blit). Frames that change much of the
+  window, or bursts that cost the CPU too much, go to the GPU as before
+  (`gpui_wgpu/src/fast/adaptive/`). The CPU rasterizer reproduces the wgpu
+  shaders and blending to within a level or two of an 8-bit channel, checked
+  pixel by pixel against the GPU (`gpui_wgpu/src/fast/cpu/`).
+
 ## What an application must do
 
 Reusing a view is safe only if gpui-fast learns about every change to state

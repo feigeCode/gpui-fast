@@ -136,6 +136,12 @@ unchanged, and a new entry needs as good a reason.
   `decode_layer_tile`, because renderers live in other crates and read scroll
   layers from the scene. Polychrome sprites whose texture index is at or
   above `LAYER_TILE_TEXTURE_BASE` are scroll layer tiles, not atlas textures.
+- `Scene` has a public `damage` field (`fast::damage::SceneDamage`, which
+  `gpui` exports), because renderers in other crates redraw only what a scene
+  changed (see [`adaptive-rendering.md`](adaptive-rendering.md)).
+- `gpui_wgpu` exports `CpuPresenter` and `CpuFrame`, and `WgpuRenderer`
+  gains `set_cpu_presenter`, so that `gpui_linux` shows the frames the
+  renderer draws on the CPU through `wl_shm` and `PutImage`.
 - `crates/gpui/Cargo.toml` names this repository and sets `publish = false`.
 - Window composition, the API of
   [zed#62379](https://github.com/zed-industries/zed/pull/62379), which
