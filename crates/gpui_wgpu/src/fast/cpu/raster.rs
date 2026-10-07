@@ -57,10 +57,6 @@ impl Canvas {
     pub(crate) fn pixels(&self) -> &[u32] {
         &self.pixels
     }
-
-    pub(crate) fn pixels_mut(&mut self) -> &mut [u32] {
-        &mut self.pixels
-    }
 }
 
 /// What the GPU renderer draws with that the shaders read besides the scene.
