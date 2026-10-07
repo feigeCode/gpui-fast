@@ -218,6 +218,52 @@ fn overlapping_primitives_of_a_layer_swapping_paint_order_are_damaged() {
     assert!(rect.contains(&point(DevicePixels(45), DevicePixels(58))));
 }
 
+/// A path at `x`, 20 px square, as a triangle fan of four corners.
+fn square_path(x: f32, color: Hsla) -> Primitive {
+    let mut path = Path::new(point(px(x), px(10.)));
+    path.line_to(point(px(x + 20.), px(10.)));
+    path.line_to(point(px(x + 20.), px(30.)));
+    path.line_to(point(px(x), px(30.)));
+    path.content_mask = ContentMask {
+        bounds: Bounds {
+            origin: point(px(-50.), px(-50.)),
+            size: size(px(300.), px(300.)),
+        },
+    };
+    path.color = color.into();
+    Primitive::Path(path.scale(1.))
+}
+
+#[test]
+fn overlapping_paths_split_into_two_batches_are_damaged() {
+    // Two overlapping paths are one batch. A quad drawn far away, at an order
+    // between theirs, splits the batch: the paths' overlap blends otherwise.
+    let paths = [
+        Op::Primitive(square_path(10., RED)),
+        Op::Primitive(square_path(20., BLUE)),
+        Op::Primitive(quad(bounds(90., 90., 10., 10.), GREEN)),
+    ];
+    let mut split = paths.to_vec();
+    split.push(Op::Primitive(quad(bounds(95., 95., 10., 10.), RED)));
+    let next = damage_between(&paths, &split);
+    let rects = &next.damage.rects;
+    let covers = |x: i32, y: i32| {
+        rects.iter().any(|r| {
+            r.origin.x.0 <= x
+                && x < r.origin.x.0 + r.size.width.0
+                && r.origin.y.0 <= y
+                && y < r.origin.y.0 + r.size.height.0
+        })
+    };
+    assert!(covers(25, 20), "the paths' overlap is damaged: {rects:?}");
+
+    // Without the split, the quad alone is damaged.
+    let mut far = paths.to_vec();
+    far.push(Op::Primitive(quad(bounds(110., 60., 10., 10.), RED)));
+    let next = damage_between(&paths, &far);
+    assert_eq!(next.damage.rects, vec![device(110, 60, 10, 10)]);
+}
+
 #[test]
 fn a_shadow_damages_its_blur() {
     let drop = |color| {

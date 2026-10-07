@@ -273,6 +273,7 @@ fn diff_primitives(prev: &Scene, next: &Scene, cx: &mut Diff) {
     diff_kind(&prev.shadows, &next.shadows, cx);
     diff_kind(&prev.quads, &next.quads, cx);
     diff_kind(&prev.paths, &next.paths, cx);
+    damage_regrouped_paths(prev, next, cx);
     diff_kind(&prev.underlines, &next.underlines, cx);
     diff_kind(&prev.monochrome_sprites, &next.monochrome_sprites, cx);
     diff_kind(&prev.subpixel_sprites, &next.subpixel_sprites, cx);
@@ -289,6 +290,91 @@ fn diff_primitives(prev: &Scene, next: &Scene, cx: &mut Diff) {
             0,
         ));
     }
+}
+
+/// Damages the paths whose batch changed. The renderer rasterizes a batch's
+/// paths together and composites each path from what the batch rasterized,
+/// so where two paths of a batch overlap, each is blended over the other:
+/// splitting or joining a batch (a primitive of another kind drawn between
+/// two paths' orders, or no longer) changes those pixels with no path
+/// changing. A batch with no equal batch in the other scene has all its paths
+/// damaged.
+fn damage_regrouped_paths(prev: &Scene, next: &Scene, cx: &mut Diff) {
+    /// Past this many batches in a scene, matching them costs more than the
+    /// paths' damage saves: every path is damaged.
+    const MAX_BATCHES: usize = 64;
+    if prev.paths.is_empty() || next.paths.is_empty() || cx.full {
+        return;
+    }
+    let prev_batches = path_batches(prev);
+    let next_batches = path_batches(next);
+    if prev_batches == next_batches && Path::same_all(&prev.paths, &next.paths) {
+        return;
+    }
+    if prev_batches.len() > MAX_BATCHES || next_batches.len() > MAX_BATCHES {
+        for path in prev.paths.iter().chain(&next.paths) {
+            cx.damage_primitive(path);
+        }
+        return;
+    }
+    let mut matched = vec![false; prev_batches.len()];
+    for batch in &next_batches {
+        let paths = &next.paths[batch.clone()];
+        let found = prev_batches.iter().enumerate().find(|(index, before)| {
+            !matched[*index] && Path::same_all(&prev.paths[(*before).clone()], paths)
+        });
+        match found {
+            Some((index, _)) => matched[index] = true,
+            None if batch.len() > 1 => paths.iter().for_each(|path| cx.damage_primitive(path)),
+            None => {}
+        }
+    }
+    for (batch, matched) in prev_batches.iter().zip(matched) {
+        if !matched && batch.len() > 1 {
+            prev.paths[batch.clone()]
+                .iter()
+                .for_each(|path| cx.damage_primitive(path));
+        }
+    }
+}
+
+/// The ranges of `scene.paths` the renderer draws as one batch each: paths
+/// with no primitive of another kind drawn between them (`Scene::batches`).
+fn path_batches(scene: &Scene) -> Vec<std::ops::Range<usize>> {
+    /// Whether a primitive of another kind is drawn after a path of order
+    /// `after` and before a path of order `before`. Kinds before paths
+    /// (shadows, quads) are drawn after a path of a lower order; the others
+    /// after a path of the same order.
+    fn between(scene: &Scene, after: u32, before: u32) -> bool {
+        fn any<T>(items: &[T], order: impl Fn(&T) -> u32, from: u32, until: u32) -> bool {
+            // `from..until`, in orders; the vectors are sorted by order.
+            let start = items.partition_point(|item| order(item) < from);
+            items.get(start).is_some_and(|item| order(item) < until)
+        }
+        let lower = after.saturating_add(1);
+        let upper = before.saturating_add(1);
+        any(&scene.shadows, |p| p.order, lower, upper)
+            || any(&scene.quads, |p| p.order, lower, upper)
+            || any(&scene.underlines, |p| p.order, after, before)
+            || any(&scene.monochrome_sprites, |p| p.order, after, before)
+            || any(&scene.subpixel_sprites, |p| p.order, after, before)
+            || any(&scene.polychrome_sprites, |p| p.order, after, before)
+            || any(&scene.surfaces, |p| p.order, after, before)
+    }
+    let mut batches = Vec::new();
+    let mut start = 0;
+    for index in 1..scene.paths.len() {
+        if between(
+            scene,
+            scene.paths[index - 1].order,
+            scene.paths[index].order,
+        ) {
+            batches.push(start..index);
+            start = index;
+        }
+    }
+    batches.push(start..scene.paths.len());
+    batches
 }
 
 /// Damages the scroll layer tiles `next` composites whose content changed
