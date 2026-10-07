@@ -55,13 +55,13 @@ gpui_pre_platform = { package = "gpui-pre-platform", version = "=0.3.7", feature
 serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true
+log.workspace = true
 smol.workspace = true
 
 # The native_webview example: a WKWebView on macOS, WebView2 on Windows, and
 # its own wgpu device drawing into a native surface on Linux.
 [dev-dependencies]
 anyhow.workspace = true
-log.workspace = true
 raw-window-handle.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

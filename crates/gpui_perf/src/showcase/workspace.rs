@@ -334,6 +334,9 @@ pub struct Workspace {
     /// Quotes each tick of the stream pushes.
     pub quotes_per_tick: usize,
     ticks: usize,
+    /// A view the toolbar shows before the market's session, for `--idle`'s
+    /// clock and spinner.
+    pub toolbar_extra: Option<AnyView>,
 }
 
 impl Workspace {
@@ -343,6 +346,7 @@ impl Workspace {
         let search = cx.new(|cx| SearchBox {
             focus: cx.focus_handle(),
             text: String::new(),
+            caret: None,
         });
 
         let watchlist = cx.new(|cx| Watchlist::new(store.clone(), &feed, cx));
@@ -399,6 +403,7 @@ impl Workspace {
             stream: None,
             quotes_per_tick: QUOTES_PER_TICK,
             ticks: 0,
+            toolbar_extra: None,
         }
     }
 
@@ -425,6 +430,21 @@ impl Workspace {
             }
         }));
         true
+    }
+
+    /// Pushes one quote for each of `symbols`, as the stream does, without
+    /// the rest of a tick: for `--idle`'s few quotes changing.
+    pub fn push_quotes(&mut self, symbols: &[usize], cx: &mut Context<Self>) {
+        self.ticks += 1;
+        let tick = self.ticks;
+        for &symbol in symbols {
+            let event = self.store.update(cx, |store, cx| {
+                let event = store.tick(symbol, tick);
+                cx.notify();
+                event
+            });
+            self.feed.update(cx, |_, cx| cx.emit(event));
+        }
     }
 
     /// Pushes one tick's quotes: each updates the store, which notifies the
@@ -583,6 +603,7 @@ impl Workspace {
                     .items_center()
                     .gap_3()
                     .text_xs()
+                    .children(self.toolbar_extra.clone())
                     .child(
                         div()
                             .flex()
@@ -694,6 +715,9 @@ impl Render for SelectionOverlay {
 pub struct SearchBox {
     pub focus: FocusHandle,
     text: String,
+    /// Whether a caret is drawn, before the text, and whether it shows;
+    /// `--idle` blinks it.
+    pub caret: Option<bool>,
 }
 
 impl Render for SearchBox {
@@ -718,6 +742,16 @@ impl Render for SearchBox {
                 theme.input
             })
             .text_color(theme.muted_foreground)
+            .when_some(self.caret, |this, visible| {
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(1.5))
+                        .h_4()
+                        .mr_1()
+                        .when(visible, |this| this.bg(theme.foreground)),
+                )
+            })
             .child(if self.text.is_empty() {
                 SharedString::from("Search symbols")
             } else {
@@ -996,6 +1030,8 @@ pub struct Watchlist {
     /// Where the rows were last laid out, in window coordinates, for an
     /// automatic run to move the pointer over them.
     pub rows_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// A row drawn as hovered, whatever the pointer does, for `--idle`.
+    pub highlighted: Option<usize>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -1012,6 +1048,7 @@ impl Watchlist {
             store,
             scroll: UniformListScrollHandle::new(),
             rows_bounds: Rc::default(),
+            highlighted: None,
         }
     }
 }
@@ -1088,6 +1125,7 @@ impl Render for Watchlist {
         let theme = theme(cx);
         let store = self.store.clone();
         let rows_bounds = self.rows_bounds.clone();
+        let highlighted = self.highlighted;
         div()
             .size_full()
             .flex()
@@ -1164,7 +1202,11 @@ impl Render for Watchlist {
                             let theme = super::theme::theme(cx);
                             let store = store.read(cx);
                             range
-                                .map(|ix| watchlist_row(ix, store, theme).into_any_element())
+                                .map(|ix| {
+                                    watchlist_row(ix, store, theme)
+                                        .when(highlighted == Some(ix), |this| this.bg(theme.accent))
+                                        .into_any_element()
+                                })
                                 .collect::<Vec<_>>()
                         })
                         .flex_1()
@@ -1179,7 +1221,7 @@ impl Render for Watchlist {
     }
 }
 
-fn watchlist_row(ix: usize, store: &QuoteStore, theme: &Theme) -> impl IntoElement {
+fn watchlist_row(ix: usize, store: &QuoteStore, theme: &Theme) -> gpui::Stateful<gpui::Div> {
     let quote = store.quotes[ix];
     let change = quote.last - quote.prev_close;
     let color = change_color(change, theme);

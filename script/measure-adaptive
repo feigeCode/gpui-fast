@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""Measure what small updates cost with and without adaptive CPU rendering.
+
+Builds gpui_perf in release once, then runs each `gpui_perf --idle` scenario
+in a real window, once per rendering mode and repetition, alternating the
+order of the modes from one repetition to the next so that clock and thermal
+drift fall on both:
+
+  gpu       GPUI_CPU_RENDER=0       every frame on the GPU
+  adaptive  (unset)                 the default: small changes on the CPU
+  always    GPUI_CPU_RENDER=always  every frame the CPU can draw, on the CPU
+
+The scenarios (`gpui_perf --idle --list`) show the trading workspace in a
+1600x1000 window and change one small thing in it for --duration seconds,
+after a warm-up:
+
+  Idle        nothing changes (the baseline)
+  CaretBlink  the focused search box's caret blinks every 500 ms
+  Clock       a clock label ticks every second
+  Hover       a watchlist row toggles hovered every 250 ms
+  Spinner     a 24 px spinner animates every frame
+  Quotes      4 watchlist rows in view get a quote every 200 ms
+  Scroll      the watchlist scrolls every frame (a large change: GPU)
+
+While each run measures (between the `gpui_perf idle: begin/end` lines it
+prints), this samples every 100 ms: the process's CPU time (utime + stime of
+all threads, /proc/<pid>/stat) and resident memory, and the GPU's power,
+utilization, performance state, graphics clock and memory (nvidia-smi). It
+runs gpui_perf with GPUI_RENDER_STATS=1 and keeps the renderer's
+`render stats:` lines from stderr, raw, and parses them loosely for frames
+drawn on the CPU and on the GPU. Before the runs it samples the GPU for
+--baseline seconds with nothing of ours running: the idle desktop, to which
+the power deltas refer. Before the baseline and before every run it waits, up
+to --cooldown seconds, for the GPU to drop back to its idle P-state, as an
+NVIDIA GPU stays clocked up for several seconds after it was last busy.
+
+Reading the table: process CPU and main ms/frame are this process's own and
+fairly stable; frames should match between modes. The GPU columns are the
+whole card's, the compositor and every other application included, and the
+card's clocks and P-states move on their own: compare modes over 20 s runs
+and several repetitions, and trust differences that hold in each repetition.
+
+Output, in --out (default target/measure-adaptive/<time>): results.json with
+every raw sample and per-run summary, summary.md with a table per scenario
+(the mean over repetitions), and each run's stdout, stderr and gpui_perf JSON.
+
+On Hyprland the window is floated and sized to 1600x1000 through hyprctl
+after it opens, as a tiling layout would otherwise size it (--no-float keeps
+the tiled size). Keep the pointer off the window and the desktop quiet while
+it runs: the GPU's power is the whole card's, compositor included.
+
+Examples:
+  script/measure-adaptive --duration 5 --reps 1
+  script/measure-adaptive --scenarios CaretBlink,Idle --modes gpu,adaptive,always
+  script/measure-adaptive --x11          # through XWayland (DISPLAY=:0)
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SCENARIOS = ["Idle", "CaretBlink", "Clock", "Hover", "Spinner", "Quotes", "Scroll"]
+MODES = {"gpu": "0", "adaptive": None, "always": "always"}
+NVIDIA_FIELDS = ["power_w", "util_pct", "pstate", "clock_mhz", "memory_mib"]
+SAMPLE_MS = 100
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+
+
+def log(message):
+    print(message, file=sys.stderr, flush=True)
+
+
+def build(no_build):
+    """Builds gpui_perf in release and returns its executable's path."""
+    command = ["cargo", "build", "--release", "-p", "gpui_perf", "--bin", "gpui_perf",
+               "--message-format=json-render-diagnostics"]
+    log("building gpui_perf (release)…" if not no_build else "finding gpui_perf…")
+    if no_build:
+        target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+        path = target / "release" / "gpui_perf"
+        if not path.exists():
+            sys.exit(f"{path} does not exist; build it or drop --no-build")
+        return path
+    process = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE, text=True)
+    if process.returncode != 0:
+        sys.exit("cargo build failed")
+    executable = None
+    for line in process.stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("reason") == "compiler-artifact" and message.get("executable") \
+                and message["target"]["name"] == "gpui_perf":
+            executable = message["executable"]
+    if not executable:
+        sys.exit("cargo did not report the gpui_perf executable")
+    return Path(executable)
+
+
+class NvidiaSampler:
+    """`nvidia-smi -lms`, each line stamped with the time it arrived."""
+
+    def __init__(self):
+        self.samples = []
+        self.process = None
+        self.thread = None
+
+    @staticmethod
+    def available():
+        return shutil.which("nvidia-smi") is not None
+
+    def start(self):
+        if not self.available():
+            return self
+        self.process = subprocess.Popen(
+            ["nvidia-smi", "--query-gpu=power.draw,utilization.gpu,pstate,clocks.gr,memory.used",
+             "--format=csv,noheader,nounits", f"-lms={SAMPLE_MS}"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+        return self
+
+    def _read(self):
+        for line in self.process.stdout:
+            now = time.time()
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) < 5:
+                continue
+            sample = {"t": now}
+            for name, value in zip(NVIDIA_FIELDS, fields):
+                if name == "pstate":
+                    sample[name] = value
+                else:
+                    try:
+                        sample[name] = float(value)
+                    except ValueError:
+                        sample[name] = None
+            self.samples.append(sample)
+
+    def stop(self):
+        if self.process:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            self.thread.join(timeout=3)
+        return self.samples
+
+
+class ProcSampler:
+    """CPU time (all threads) and resident memory of a process, from /proc."""
+
+    def __init__(self, pid):
+        self.pid = pid
+        self.samples = []
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def _read(self):
+        with open(f"/proc/{self.pid}/stat") as file:
+            stat = file.read()
+        # The command name may hold spaces: the fields after it follow ')'.
+        fields = stat[stat.rindex(")") + 2:].split()
+        utime, stime = int(fields[11]), int(fields[12])
+        with open(f"/proc/{self.pid}/statm") as file:
+            rss_pages = int(file.read().split()[1])
+        return {"t": time.time(), "cpu_s": (utime + stime) / CLK_TCK,
+                "rss_mib": rss_pages * PAGE_SIZE / 2**20}
+
+    def _run(self):
+        while not self.stopped.is_set():
+            try:
+                self.samples.append(self._read())
+            except (OSError, ValueError, IndexError):
+                break
+            self.stopped.wait(SAMPLE_MS / 1000)
+
+    def stop(self):
+        self.stopped.set()
+        self.thread.join(timeout=3)
+        return self.samples
+
+
+def hyprland():
+    return bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")) and shutil.which("hyprctl")
+
+
+def hyprctl_json(*args):
+    try:
+        return json.loads(subprocess.run(["hyprctl", "-j", *args], capture_output=True,
+                                         text=True, timeout=5).stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+
+
+def float_window(pid, width, height, deadline):
+    """Floats the window of `pid` on Hyprland, sized and centered on the
+    focused monitor. Returns the window's size, or None."""
+    while time.time() < deadline:
+        clients = hyprctl_json("clients") or []
+        window = next((c for c in clients if c.get("pid") == pid), None)
+        if window:
+            break
+        time.sleep(0.1)
+    else:
+        return None
+    monitors = hyprctl_json("monitors") or []
+    monitor = next((m for m in monitors if m.get("focused")), monitors[0] if monitors else None)
+    x = y = None
+    if monitor:
+        scale = monitor.get("scale") or 1
+        x = monitor["x"] + int((monitor["width"] / scale - width) / 2)
+        y = monitor["y"] + int((monitor["height"] / scale - height) / 2)
+    selector = f"pid:{pid}"
+    # Hyprland 0.55 and later take Lua dispatches; earlier ones, the old
+    # dispatchers.
+    lua = [f'hl.dsp.window.float({{ action = "enable", window = "{selector}" }})',
+           f'hl.dsp.window.resize({{ x = {width}, y = {height}, window = "{selector}" }})']
+    legacy = [["setfloating", selector],
+              ["resizewindowpixel", f"exact {width} {height},{selector}"]]
+    if x is not None:
+        lua.append(f'hl.dsp.window.move({{ x = {x}, y = {y}, window = "{selector}" }})')
+        legacy.append(["movewindowpixel", f"exact {x} {y},{selector}"])
+    for expression, old in zip(lua, legacy):
+        result = subprocess.run(["hyprctl", "dispatch", expression], capture_output=True,
+                                text=True, timeout=5)
+        if result.stdout.strip() != "ok":
+            subprocess.run(["hyprctl", "dispatch", *old], capture_output=True, timeout=5)
+    time.sleep(0.2)
+    clients = hyprctl_json("clients") or []
+    window = next((c for c in clients if c.get("pid") == pid), None)
+    return window.get("size") if window else None
+
+
+RENDER_STATS = "render stats:"
+KEY_VALUE = re.compile(r"([A-Za-z_][\w.\-/]*)\s*[=:]\s*(-?\d+(?:\.\d+)?)")
+PATH_COUNT = [
+    re.compile(r"\b(cpu|gpu)[\s_.\-]*(?:frames?)?\s*[=:]?\s*(\d+)\b", re.I),
+    re.compile(r"\b(\d+)\s*(cpu|gpu)\b", re.I),
+]
+
+
+def parse_render_stats(line):
+    """Loosely reads a `render stats:` line: its key=value numbers, and how
+    many frames it says each path drew, where it can tell."""
+    text = line.split(RENDER_STATS, 1)[1] if RENDER_STATS in line else line
+    values = {key: float(value) for key, value in KEY_VALUE.findall(text)}
+    frames = {}
+    for key, value in values.items():
+        lower = key.lower()
+        if "frame" in lower or lower in ("cpu", "gpu"):
+            for path in ("cpu", "gpu"):
+                if path in lower and path not in frames:
+                    frames[path] = value
+    if not frames:
+        for pattern in PATH_COUNT:
+            for match in pattern.finditer(text):
+                a, b = match.groups()
+                path, count = (a, b) if a.isalpha() else (b, a)
+                frames.setdefault(path.lower(), float(count))
+    return {"values": values, "frames": frames}
+
+
+def cool_down(target, limit):
+    """Waits, up to `limit` seconds, for the GPU to drop back to performance
+    state `target` or a slower one (the one the idle desktop mostly sat in),
+    so that one run's clocks do not carry over into the next. Returns the
+    seconds waited."""
+    if limit <= 0 or not target or not NvidiaSampler.available():
+        return 0
+    started = time.time()
+    settled = None
+    while time.time() - started < limit:
+        try:
+            pstate = subprocess.run(
+                ["nvidia-smi", "--query-gpu=pstate", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5).stdout.strip()
+        except subprocess.SubprocessError:
+            return time.time() - started
+        # P-states count up as they slow down: P8 is idler than P5.
+        if pstate and int(pstate.lstrip("P") or 0) >= int(target.lstrip("P") or 0):
+            settled = settled or time.time()
+            if time.time() - settled >= 1:
+                break
+        else:
+            settled = None
+        time.sleep(0.25)
+    return time.time() - started
+
+
+def summarize_gpu(samples, baseline_power):
+    if not samples:
+        return {}
+    powers = [s["power_w"] for s in samples if s.get("power_w") is not None]
+    utils = [s["util_pct"] for s in samples if s.get("util_pct") is not None]
+    clocks = [s["clock_mhz"] for s in samples if s.get("clock_mhz") is not None]
+    memory = [s["memory_mib"] for s in samples if s.get("memory_mib") is not None]
+    pstates = {}
+    for sample in samples:
+        pstates[sample["pstate"]] = pstates.get(sample["pstate"], 0) + 1
+    summary = {
+        "samples": len(samples),
+        "power_w_mean": statistics.fmean(powers) if powers else None,
+        "util_pct_mean": statistics.fmean(utils) if utils else None,
+        "clock_mhz_mean": statistics.fmean(clocks) if clocks else None,
+        "memory_mib_mean": statistics.fmean(memory) if memory else None,
+        "pstate_fraction": {k: v / len(samples) for k, v in sorted(pstates.items())},
+    }
+    if summary["power_w_mean"] is not None and baseline_power is not None:
+        summary["power_w_delta"] = summary["power_w_mean"] - baseline_power
+    return summary
+
+
+def summarize_proc(samples, begin, end):
+    inside = [s for s in samples if begin <= s["t"] <= end]
+    if len(inside) < 2:
+        return {}
+    first, last = inside[0], inside[-1]
+    elapsed = last["t"] - first["t"]
+    return {
+        "samples": len(inside),
+        "cpu_s": last["cpu_s"] - first["cpu_s"],
+        "cpu_pct": (last["cpu_s"] - first["cpu_s"]) * 100 / elapsed if elapsed > 0 else None,
+        "rss_mib_mean": statistics.fmean(s["rss_mib"] for s in inside),
+        "rss_mib_max": max(s["rss_mib"] for s in inside),
+    }
+
+
+def run_once(binary, scenario, mode, args, run_dir, baseline_power):
+    """One gpui_perf run of `scenario` in `mode`; returns its record."""
+    env = dict(os.environ)
+    env["GPUI_RENDER_STATS"] = "1"
+    env.pop("GPUI_CPU_RENDER", None)
+    if MODES[mode] is not None:
+        env["GPUI_CPU_RENDER"] = MODES[mode]
+    if args.x11:
+        env.pop("WAYLAND_DISPLAY", None)
+        env["DISPLAY"] = env.get("DISPLAY") or ":0"
+    name = f"{scenario}-{mode}-{run_dir.name}"
+    stem = run_dir / name
+    command = [str(binary), "--idle", "--only", scenario, "--duration", str(args.duration),
+               "--warmup", str(args.warmup), "--json", f"{stem}.json"]
+    nvidia = NvidiaSampler().start()
+    launched = time.time()
+    process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+    proc = ProcSampler(process.pid).start()
+    markers, stdout_lines, stderr_lines, render_stats = {}, [], [], []
+
+    def read_stdout():
+        for line in process.stdout:
+            stdout_lines.append(line)
+            match = re.match(r"gpui_perf idle: (begin|end) (\w+) ([\d.]+)", line)
+            if match:
+                markers[match.group(1)] = float(match.group(3))
+
+    def read_stderr():
+        for line in process.stderr:
+            stderr_lines.append(line)
+            if RENDER_STATS in line:
+                render_stats.append({"t": time.time(), "line": line.rstrip("\n")})
+
+    readers = [threading.Thread(target=read_stdout, daemon=True),
+               threading.Thread(target=read_stderr, daemon=True)]
+    for reader in readers:
+        reader.start()
+    window_size = None
+    if args.float and hyprland():
+        window_size = float_window(process.pid, 1600, 1000, launched + 10)
+    timeout = args.warmup + args.duration + 90
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        log(f"  {name}: timed out after {timeout:.0f} s")
+    for reader in readers:
+        reader.join(timeout=3)
+    proc_samples = proc.stop()
+    gpu_samples = nvidia.stop()
+    (stem.with_suffix(".stdout")).write_text("".join(stdout_lines))
+    (stem.with_suffix(".stderr")).write_text("".join(stderr_lines))
+
+    # The measured stretch, as gpui_perf marks it; failing that, all but the
+    # first two seconds.
+    begin = markers.get("begin", launched + 2)
+    end = markers.get("end", time.time())
+    gpu_inside = [s for s in gpu_samples if begin <= s["t"] <= end]
+    stats_inside = [s for s in render_stats if begin <= s["t"] <= end + 1]
+    path_frames = {}
+    for entry in stats_inside:
+        parsed = parse_render_stats(entry["line"])
+        entry["parsed"] = parsed
+        for path, count in parsed["frames"].items():
+            path_frames[path] = path_frames.get(path, 0) + count
+    try:
+        app = json.loads(Path(f"{stem}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        app = None
+    app_result = (app or {}).get("results", [{}])[0] if app else {}
+    record = {
+        "scenario": scenario,
+        "mode": mode,
+        "command": command,
+        "env": {k: env.get(k) for k in ("GPUI_CPU_RENDER", "GPUI_RENDER_STATS",
+                                        "WAYLAND_DISPLAY", "DISPLAY")},
+        "exit_code": process.returncode,
+        "launched": launched,
+        "begin": begin,
+        "end": end,
+        "marked": "begin" in markers and "end" in markers,
+        "hyprland_window_size": window_size,
+        "app": app,
+        "proc": summarize_proc(proc_samples, begin, end),
+        "gpu": summarize_gpu(gpu_inside, baseline_power),
+        "render_frames": path_frames,
+        "render_stats": stats_inside,
+        "raw": {"proc": proc_samples, "gpu": gpu_samples},
+    }
+    gpu = record["gpu"]
+    log(f"  {scenario:<10} {mode:<8} frames {app_result.get('frames', '-')!s:>5}  "
+        f"cpu {fmt(record['proc'].get('cpu_pct'), '%', 1)}  "
+        f"gpu {fmt(gpu.get('util_pct_mean'), '%', 0)} {fmt(gpu.get('power_w_mean'), 'W', 1)}"
+        + ("" if process.returncode == 0 else f"  exit {process.returncode}"))
+    return record
+
+
+def fmt(value, unit="", digits=1):
+    return "-" if value is None else f"{value:.{digits}f}{unit}"
+
+
+def mean(values):
+    values = [v for v in values if v is not None]
+    return statistics.fmean(values) if values else None
+
+
+def summary_markdown(results, baseline, args, window):
+    lines = [
+        "# Adaptive rendering: small updates",
+        "",
+        f"{datetime.datetime.now():%Y-%m-%d %H:%M}, {'X11 (XWayland)' if args.x11 else 'Wayland'}"
+        f", {args.duration:g} s per run after {args.warmup:g} s warm-up, {args.reps} "
+        f"repetition(s), window {window}. Idle desktop GPU: "
+        f"{fmt(baseline.get('power_w_mean'), ' W', 1)}, "
+        f"{fmt(baseline.get('util_pct_mean'), ' %', 0)} util, pstates "
+        f"{pstates_text(baseline.get('pstate_fraction'))}.",
+        "",
+        "| Scenario | Mode | Frames | FPS | Process CPU | Main ms/frame (p50/p95) "
+        "| GPU util | GPU power | ΔW vs idle | P-states | Renderer CPU/GPU frames |",
+        "|---|---|---:|---:|---:|---|---:|---:|---:|---|---|",
+    ]
+    for scenario in args.scenarios:
+        for mode in args.modes:
+            runs = [r for r in results if r["scenario"] == scenario and r["mode"] == mode]
+            if not runs:
+                continue
+            apps = [((r["app"] or {}).get("results") or [{}])[0] for r in runs]
+            pstate = {}
+            for run in runs:
+                for key, value in (run["gpu"].get("pstate_fraction") or {}).items():
+                    pstate[key] = pstate.get(key, 0) + value / len(runs)
+            frames = {}
+            for run in runs:
+                for key, value in run["render_frames"].items():
+                    frames[key] = frames.get(key, 0) + value / len(runs)
+            split = (f"{frames.get('cpu', 0):.0f} / {frames.get('gpu', 0):.0f}"
+                     if frames else "-")
+            p50 = mean(a.get("main_ms_per_frame_p50") for a in apps)
+            p95 = mean(a.get("main_ms_per_frame_p95") for a in apps)
+            lines.append(
+                f"| {scenario} | {mode} | {fmt(mean(a.get('frames') for a in apps), '', 0)} "
+                f"| {fmt(mean(a.get('fps') for a in apps), '', 1)} "
+                f"| {fmt(mean(r['proc'].get('cpu_pct') for r in runs), ' %', 1)} "
+                f"| {fmt(p50, '', 2)} / {fmt(p95, '', 2)} "
+                f"| {fmt(mean(r['gpu'].get('util_pct_mean') for r in runs), ' %', 1)} "
+                f"| {fmt(mean(r['gpu'].get('power_w_mean') for r in runs), ' W', 1)} "
+                f"| {fmt_signed(mean(r['gpu'].get('power_w_delta') for r in runs))} "
+                f"| {pstates_text(pstate)} | {split} |")
+    lines += [
+        "",
+        "Means over repetitions. Process CPU: utime + stime of all threads from "
+        "/proc/<pid>/stat over the measured stretch, as a share of one core. Main "
+        "ms/frame: the main thread's CPU between two updates per frame drawn (gpui_perf). "
+        "GPU columns: nvidia-smi every 100 ms; the power is the whole card's, desktop "
+        "compositor included, and ΔW is against the idle desktop sampled before the runs. "
+        "Renderer CPU/GPU frames: summed from the `render stats:` lines, where they say.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def fmt_signed(value):
+    return "-" if value is None else f"{value:+.1f} W"
+
+
+def pstates_text(fractions):
+    if not fractions:
+        return "-"
+    return " ".join(f"{k} {v * 100:.0f}%" for k, v in sorted(fractions.items()))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--scenarios", default=",".join(SCENARIOS),
+                        help="comma-separated scenarios (default: all)")
+    parser.add_argument("--duration", type=float, default=20, help="measured seconds per run")
+    parser.add_argument("--warmup", type=float, default=8,
+                        help="seconds before measuring (default 8: an NVIDIA GPU stays in P0 "
+                             "for ~5 s after the window opens)")
+    parser.add_argument("--reps", type=int, default=2, help="repetitions of every run")
+    parser.add_argument("--modes", default="gpu,adaptive",
+                        help="comma-separated, of gpu, adaptive, always (default gpu,adaptive)")
+    parser.add_argument("--out", type=Path, help="output directory")
+    parser.add_argument("--baseline", type=float, default=10,
+                        help="seconds of idle-desktop GPU sampling first (0 to skip)")
+    parser.add_argument("--cooldown", type=float, default=15,
+                        help="before each run, wait up to this many seconds for the GPU to "
+                             "drop back to the idle desktop's P-state (0 to skip)")
+    parser.add_argument("--x11", action="store_true",
+                        help="run through X11 (unset WAYLAND_DISPLAY, DISPLAY=:0 if unset)")
+    parser.add_argument("--no-float", dest="float", action="store_false",
+                        help="on Hyprland, leave the window tiled instead of floating it "
+                             "at 1600x1000")
+    parser.add_argument("--no-build", action="store_true",
+                        help="use target/release/gpui_perf as it is")
+    args = parser.parse_args()
+
+    by_name = {s.lower(): s for s in SCENARIOS}
+    try:
+        args.scenarios = [by_name[s.strip().lower()] for s in args.scenarios.split(",") if s.strip()]
+    except KeyError as error:
+        parser.error(f"unknown scenario {error}; one of {', '.join(SCENARIOS)}")
+    args.modes = [m.strip().lower() for m in args.modes.split(",") if m.strip()]
+    for mode in args.modes:
+        if mode not in MODES:
+            parser.error(f"unknown mode {mode!r}; one of {', '.join(MODES)}")
+    if args.x11 and not (os.environ.get("DISPLAY") or Path("/tmp/.X11-unix/X0").exists()):
+        parser.error("--x11 needs an X server (DISPLAY)")
+
+    out = args.out or ROOT / "target" / "measure-adaptive" / datetime.datetime.now().strftime(
+        "%Y%m%d-%H%M%S")
+    out.mkdir(parents=True, exist_ok=True)
+    binary = build(args.no_build)
+    if not NvidiaSampler.available():
+        log("nvidia-smi not found: no GPU samples")
+
+    baseline_samples = []
+    if args.baseline > 0 and NvidiaSampler.available():
+        cool_down("P8", args.cooldown)
+        log(f"sampling the idle desktop's GPU for {args.baseline:g} s; keep the desktop quiet…")
+        sampler = NvidiaSampler().start()
+        time.sleep(args.baseline)
+        baseline_samples = sampler.stop()
+    baseline = summarize_gpu(baseline_samples, None)
+    baseline_power = baseline.get("power_w_mean")
+    fractions = baseline.get("pstate_fraction") or {}
+    idle_pstate = max(fractions, key=fractions.get) if fractions else "P8"
+
+    results = []
+    for rep in range(args.reps):
+        run_dir = out / f"rep{rep + 1}"
+        run_dir.mkdir(exist_ok=True)
+        modes = args.modes if rep % 2 == 0 else list(reversed(args.modes))
+        log(f"repetition {rep + 1}/{args.reps}")
+        for index, scenario in enumerate(args.scenarios):
+            # Alternate within a repetition too, so neither mode always runs first.
+            order = modes if index % 2 == 0 else list(reversed(modes))
+            for mode in order:
+                waited = cool_down(idle_pstate, args.cooldown)
+                results.append(run_once(binary, scenario, mode, args, run_dir, baseline_power))
+                results[-1]["cooled_down_s"] = waited
+
+    windows = {f"{a['window']['width']:.0f}x{a['window']['height']:.0f} logical, scale "
+               f"{a['window']['scale']:g}" for a in (r["app"] for r in results) if a}
+    window = "; ".join(sorted(windows)) or "unknown"
+    document = {
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+        "binary": str(binary),
+        "host": {"uname": " ".join(os.uname()),
+                 "governor": read_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+                 "session": "x11" if args.x11 else os.environ.get("XDG_SESSION_TYPE")},
+        "baseline": {"summary": baseline, "samples": baseline_samples},
+        "runs": results,
+    }
+    (out / "results.json").write_text(json.dumps(document, indent=1))
+    markdown = summary_markdown(results, baseline, args, window)
+    (out / "summary.md").write_text(markdown)
+    print(markdown)
+    log(f"wrote {out / 'results.json'} and {out / 'summary.md'}")
+    if any(r["exit_code"] != 0 or not r["marked"] for r in results):
+        log("some runs failed or did not mark their measured stretch; see their .stderr")
+        return 1
+    return 0
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+if __name__ == "__main__":
+    sys.exit(main())
