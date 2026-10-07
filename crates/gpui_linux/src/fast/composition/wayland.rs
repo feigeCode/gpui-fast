@@ -526,6 +526,7 @@ impl WaylandComposition {
     fn resize(&mut self, size: Size<DevicePixels>, scale: f32) {
         self.size = size;
         self.scale = scale;
+        crate::fast::cpu_present::wayland::window_resized(&self.window_surface, size, scale);
         for surface in self.gpui_surfaces.values_mut() {
             surface.renderer.update_drawable_size(size);
             surface.subsurface.set_size(size, scale);
