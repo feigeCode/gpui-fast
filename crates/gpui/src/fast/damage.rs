@@ -65,7 +65,8 @@ impl SceneDamage {
 
 /// Rectangles closer than this, in device pixels, are merged into one.
 const MERGE_DISTANCE: i32 = 8;
-/// Past this many rectangles, all are merged into one.
+/// The most rectangles a damage keeps: past it, the two whose union adds the
+/// fewest pixels are merged.
 const MAX_RECTS: usize = 16;
 
 /// What a window keeps from one frame's damage to the next: the room the
@@ -840,19 +841,33 @@ impl Rects {
         {
             return;
         }
-        while let Some(index) = self.rects.iter().position(|kept| kept.near(&rect)) {
-            let kept = self.rects.swap_remove(index);
-            rect = rect.union(&kept);
+        loop {
+            while let Some(index) = self.rects.iter().position(|kept| kept.near(&rect)) {
+                let kept = self.rects.swap_remove(index);
+                rect = rect.union(&kept);
+            }
+            if self.rects.len() < MAX_RECTS {
+                break;
+            }
+            // Too many: the two rectangles whose union adds the fewest pixels
+            // become one, so that changes spread over the window stay apart
+            // instead of becoming one rectangle over all of them.
+            self.rects.push(rect);
+            let mut cheapest = (0, 1, i64::MAX);
+            for i in 0..self.rects.len() {
+                for j in i + 1..self.rects.len() {
+                    let (a, b) = (&self.rects[i], &self.rects[j]);
+                    let cost = a.union(b).area() - a.area() - b.area();
+                    if cost < cheapest.2 {
+                        cheapest = (i, j, cost);
+                    }
+                }
+            }
+            let b = self.rects.swap_remove(cheapest.1);
+            let a = self.rects.swap_remove(cheapest.0);
+            rect = a.union(&b);
         }
         self.rects.push(rect);
-        if self.rects.len() > MAX_RECTS {
-            let all = self
-                .rects
-                .iter()
-                .fold(self.rects[0], |all, rect| all.union(rect));
-            self.rects.clear();
-            self.rects.push(all);
-        }
         self.area = self.rects.iter().map(Rect::area).sum();
     }
 }

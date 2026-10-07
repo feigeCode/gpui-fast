@@ -75,8 +75,9 @@ tile did not change; a tile listed in its layer's `dirty_tiles` under a new
 `generation` is damaged.
 
 Damaged rectangles are merged as they are added: a rectangle within 8 px of
-one already kept is unioned into it, and past 16 rectangles all are unioned
-into one. A damage that covers more than half the window is reported as one
+one already kept is unioned into it, and past 16 rectangles the two whose
+union adds the fewest pixels are merged, so changes spread over the window
+stay apart. A damage that covers more than half the window is reported as one
 rectangle over the whole window.
 
 Atlas content is outside the scene: an atlas tile freed and allocated again to

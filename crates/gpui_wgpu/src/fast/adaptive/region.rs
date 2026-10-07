@@ -9,7 +9,8 @@ use gpui::{AtlasTextureId, AtlasTile, Bounds, DevicePixels, Point, ScaledPixels,
 /// unioned into it.
 pub(crate) const MERGE_DISTANCE: i32 = 8;
 
-/// Past this many rectangles, a region is unioned into one.
+/// The most rectangles a region keeps: past it, the two whose union adds the
+/// fewest pixels are merged.
 pub(crate) const MAX_RECTS: usize = 16;
 
 /// A region of a frame: rectangles in device pixels, none empty.
@@ -44,14 +45,31 @@ impl Region {
         if is_empty(&rect) {
             return;
         }
-        while let Some(ix) = self.rects.iter().position(|kept| near(kept, &rect)) {
-            rect = union(self.rects.swap_remove(ix), rect);
+        loop {
+            while let Some(ix) = self.rects.iter().position(|kept| near(kept, &rect)) {
+                rect = union(self.rects.swap_remove(ix), rect);
+            }
+            if self.rects.len() < MAX_RECTS {
+                break;
+            }
+            // Too many: the two rectangles whose union adds the fewest pixels
+            // become one.
+            self.rects.push(rect);
+            let mut cheapest = (0, 1, i64::MAX);
+            for i in 0..self.rects.len() {
+                for j in i + 1..self.rects.len() {
+                    let (a, b) = (self.rects[i], self.rects[j]);
+                    let cost = area(&union(a, b)) - area(&a) - area(&b);
+                    if cost < cheapest.2 {
+                        cheapest = (i, j, cost);
+                    }
+                }
+            }
+            let b = self.rects.swap_remove(cheapest.1);
+            let a = self.rects.swap_remove(cheapest.0);
+            rect = union(a, b);
         }
         self.rects.push(rect);
-        if self.rects.len() > MAX_RECTS {
-            let all = self.rects.drain(..).reduce(union).expect("not empty");
-            self.rects.push(all);
-        }
     }
 
     pub(crate) fn add_all(&mut self, rects: &[Bounds<DevicePixels>], clip: Bounds<DevicePixels>) {
@@ -266,14 +284,14 @@ mod tests {
         region.add(rect(20, 5, 85, 100), clip);
         assert_eq!(region.rects(), &[rect(0, 0, 110, 110)]);
 
+        // Past the cap, the pair whose union adds the fewest pixels merges:
+        // here two neighbours, the rest stay apart.
         let mut region = Region::default();
         for i in 0..=MAX_RECTS as i32 {
             region.add(rect(i * 50, 0, 10, 10), clip);
         }
-        assert_eq!(
-            region.rects(),
-            &[rect(0, 0, MAX_RECTS as i32 * 50 + 10, 10)]
-        );
+        assert_eq!(region.rects().len(), MAX_RECTS);
+        assert_eq!(region.area(), (MAX_RECTS as i64 - 1) * 100 + 600);
     }
 
     #[test]

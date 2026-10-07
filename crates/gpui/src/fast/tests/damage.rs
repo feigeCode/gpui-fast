@@ -385,7 +385,7 @@ fn damage_over_half_the_window_covers_it_and_a_resize_starts_over() {
 }
 
 #[test]
-fn nearby_rects_merge_and_many_become_one() {
+fn nearby_rects_merge_and_too_many_merge_cheapest_first() {
     let row = |colors: &[Hsla]| -> Vec<Op> {
         colors
             .iter()
@@ -397,7 +397,8 @@ fn nearby_rects_merge_and_many_become_one() {
     let next = damage_between(&row(&[RED, RED, RED]), &row(&[BLUE, BLUE, BLUE]));
     assert_eq!(next.damage.rects, vec![device(0, 0, 16, 2)]);
 
-    // Seventeen far apart become their bounding rectangle.
+    // Seventeen far apart: two of them merge, the pair whose union adds the
+    // fewest pixels (two in a row, 20px apart), and the rest stay apart.
     let spots = |color| -> Vec<Op> {
         (0..17)
             .map(|i| {
@@ -407,7 +408,17 @@ fn nearby_rects_merge_and_many_become_one() {
             .collect()
     };
     let next = damage_between(&spots(RED), &spots(BLUE));
-    assert_eq!(next.damage.rects, vec![device(0, 0, 101, 41)]);
+    let rects = &next.damage.rects;
+    assert_eq!(rects.len(), 16, "{rects:?}");
+    assert_eq!(
+        rects
+            .iter()
+            .filter(|r| r.size == size(DevicePixels(21), DevicePixels(1)))
+            .count(),
+        1,
+        "{rects:?}"
+    );
+    assert_eq!(next.damage.area(), 15 + 21);
 }
 
 // Random scenes and random changes to them.
