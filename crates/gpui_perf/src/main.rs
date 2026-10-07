@@ -34,6 +34,13 @@
 //!   (default 16), for comparing refresh workloads with the same build.
 //! - `--no-hold-clock`: on macOS, measure `--auto` without holding the CPU's
 //!   clock up; see `showcase/clock.rs`.
+//! - `--idle`: run small-update scenarios (`CaretBlink`, `Clock`, `Hover`,
+//!   `Spinner`, `Quotes`, `Scroll`, `Idle`) in a 1600×1000 window of the
+//!   trading workspace, each for a fixed time, and report the frames drawn
+//!   and the CPU they cost; `--only A,B`, `--duration SECS` (default 20),
+//!   `--warmup SECS` (default 2), `--json PATH`, `--list`. See
+//!   `showcase/idle.rs`, and `script/measure-adaptive`, which runs them with
+//!   and without CPU rendering and samples the GPU.
 //!
 //! Headless flags:
 //!
@@ -75,6 +82,7 @@ use gpui_perf::runner::{self, Options, RetentionModes};
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 const USAGE: &str = "usage: gpui_perf [--demo | --auto [--only SCENARIO] [--retention on|off] [--frames N] [--no-hold-clock]]\n       \
+gpui_perf --idle [--only SCENARIO[,SCENARIO...]] [--duration SECS] [--warmup SECS] [--json PATH] [--list]\n       \
 gpui_perf --headless [--scenario SUBSTRING]... [--frames N] [--warmup N] \
 [--retention on|off|both] [--json PATH] [--verify] [--list]";
 
@@ -94,6 +102,7 @@ fn main() -> ExitCode {
         showcase::run(
             args.iter().any(|arg| arg == "--auto"),
             args.iter().any(|arg| arg == "--demo"),
+            args.iter().any(|arg| arg == "--idle"),
         );
         return ExitCode::SUCCESS;
     }

@@ -29,6 +29,12 @@
 //! the scenarios instead. On macOS it holds the CPU's clock up while it
 //! measures; see `clock.rs`.
 //!
+//! With `--idle`, it shows the trading workspace in a larger window and runs
+//! small-update scenarios for a fixed time each — a caret blinking, a clock
+//! ticking, a row hovered, a spinner, a few quotes, the watchlist scrolling,
+//! nothing at all — reporting the frames drawn and the CPU they cost; see
+//! `idle.rs`.
+//!
 //! Built with the `upstream` feature it runs on upstream GPUI, the
 //! `gpui-pre` snapshot GPUI Kit pins, for comparison; see `backend.rs`.
 
@@ -37,6 +43,7 @@ mod auto;
 mod backend;
 pub mod clock;
 mod controls;
+mod idle;
 mod metrics;
 mod pages;
 mod theme;
@@ -235,10 +242,17 @@ const DEMO_STEP: Duration = Duration::from_secs(6);
 /// `demo`, it scrolls the sidebar, a page, the table and the list in turn,
 /// for as long as it is open, for recording or watching two GPUIs side by
 /// side.
-pub fn run(auto: bool, demo: bool) {
+pub fn run(auto: bool, demo: bool, idle: bool) {
     if auto && std::env::args().any(|arg| arg == "--list") {
         auto::list();
         return;
+    }
+    if idle && std::env::args().any(|arg| arg == "--list") {
+        idle::list();
+        return;
+    }
+    if idle {
+        idle::init_render_stats_log();
     }
     application().run(move |cx: &mut App| {
         if !example_support::load_fonts(cx) {
@@ -262,7 +276,11 @@ pub fn run(auto: bool, demo: bool) {
                 focus: true,
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
-                    size(px(1280.), px(820.)),
+                    if idle {
+                        idle::WINDOW_SIZE
+                    } else {
+                        size(px(1280.), px(820.))
+                    },
                     cx,
                 ))),
                 window_min_size: Some(size(px(800.), px(480.))),
@@ -275,7 +293,7 @@ pub fn run(auto: bool, demo: bool) {
             },
             |window, cx| {
                 Theme::follow(window, cx);
-                cx.new(|cx| Showcase::new(auto, demo, window, cx))
+                cx.new(|cx| Showcase::new(auto, demo, idle, window, cx))
             },
         )
         .unwrap();
@@ -448,7 +466,13 @@ fn step(
 }
 
 impl Showcase {
-    fn new(auto: bool, demo: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        auto: bool,
+        demo: bool,
+        idle: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let container = cx.new(|cx| {
             let mut container = Container::new(BUTTON_PAGE, cx);
             container.title = page_name(BUTTON_PAGE).into();
@@ -467,6 +491,12 @@ impl Showcase {
         });
         cx.set_global(SharedAppState(app_state.clone()));
         let ticked = app_state.downgrade();
+        // `--idle` measures windows where only its scenario changes.
+        let ticked = if idle {
+            WeakEntity::new_invalid()
+        } else {
+            ticked
+        };
         cx.spawn(async move |_, cx| {
             loop {
                 cx.background_executor().timer(APP_STATE_EVERY).await;
@@ -481,7 +511,11 @@ impl Showcase {
         })
         .detach();
 
-        let sampled = stats.downgrade();
+        let sampled = if idle {
+            WeakEntity::new_invalid()
+        } else {
+            stats.downgrade()
+        };
         cx.spawn_in(window, async move |_, cx| {
             loop {
                 cx.background_executor().timer(SAMPLE_EVERY).await;
@@ -529,6 +563,9 @@ impl Showcase {
         };
         if auto || demo {
             this.start_frames(window, cx);
+        }
+        if idle {
+            idle::start(window, cx);
         }
         this
     }
