@@ -9839,11 +9839,12 @@ mod dynamic_texture_tests {
     impl PlatformAtlas for RecordingAtlas {
         fn get_or_insert_with<'a>(
             &self,
-            key: &AtlasKey,
+            key: AtlasKey,
             build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
         ) -> Result<Option<AtlasTile>> {
             let mut state = self.0.lock();
             if let Some(tile) = state.tile {
+                assert!(matches!(key, AtlasKey::DynamicTexture(_)));
                 return Ok(Some(tile));
             }
             drop(state);
@@ -9864,7 +9865,6 @@ mod dynamic_texture_tests {
             let mut state = self.0.lock();
             state.builds.push(bytes.into_owned());
             state.tile = Some(tile);
-            assert!(matches!(key, AtlasKey::DynamicTexture(_)));
             Ok(Some(tile))
         }
 

@@ -1,10 +1,12 @@
 use crate::{
-    AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, HeadlessAtlas, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size, TestPlatform,
-    TextInputConfiguration, TextInputStateChange, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowInsets, WindowParams, WindowVisibility,
+    AnyWindowHandle, AtlasKey, AtlasTile, AtlasTextureId, Bounds, DevicePixels,
+    DispatchEventResult, GpuSpecs, HeadlessAtlas, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TextInputConfiguration,
+    TextInputStateChange, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowInsets, WindowParams, WindowVisibility,
 };
+use collections::HashMap;
 use gpui_util::ResultExt as _;
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -620,13 +622,13 @@ impl TestAtlas {
 impl PlatformAtlas for TestAtlas {
     fn get_or_insert_with<'a>(
         &self,
-        key: &crate::AtlasKey,
+        key: AtlasKey,
         build: &mut dyn FnMut() -> anyhow::Result<
-            Option<(Size<crate::DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
+            Option<(Size<DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
         >,
-    ) -> anyhow::Result<Option<crate::AtlasTile>> {
+    ) -> anyhow::Result<Option<AtlasTile>> {
         let mut state = self.0.lock();
-        if let Some(&tile) = state.tiles.get(key) {
+        if let Some(&tile) = state.tiles.get(&key) {
             return Ok(Some(tile));
         }
         drop(state);
@@ -643,21 +645,21 @@ impl PlatformAtlas for TestAtlas {
 
         state.tiles.insert(
             key.clone(),
-            crate::AtlasTile {
+            AtlasTile {
                 texture_id: AtlasTextureId {
                     index: texture_id,
                     kind: key.texture_kind(),
                 },
                 tile_id: TileId(tile_id),
                 padding: 0,
-                bounds: crate::Bounds {
+                bounds: Bounds {
                     origin: Point::default(),
                     size,
                 },
             },
         );
 
-        Ok(Some(state.tiles[key]))
+        Ok(Some(state.tiles[&key]))
     }
 
     fn update(
@@ -709,7 +711,7 @@ mod dynamic_texture_tests {
             height: DevicePixels(3),
         };
         let mut build = || Ok(Some((texture_size, Cow::Owned(vec![0; 48]))));
-        let tile = atlas.get_or_insert_with(&key, &mut build).unwrap().unwrap();
+        let tile = atlas.get_or_insert_with(key.clone(), &mut build).unwrap().unwrap();
         let update_bounds = Bounds {
             origin: Point {
                 x: DevicePixels(1),
@@ -726,7 +728,7 @@ mod dynamic_texture_tests {
         atlas.0.lock().resource_generation = 3;
 
         let state = atlas.0.lock();
-        assert_eq!(tile.texture_id.kind, crate::AtlasTextureKind::Polychrome);
+        assert_eq!(tile.texture_id.kind, crate::AtlasTextureKind::DynamicTexture);
         assert_eq!(state.updates.len(), 1);
         assert!(state.updates[0].key == key);
         assert_eq!(state.updates[0].bounds, update_bounds);

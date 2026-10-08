@@ -81,7 +81,7 @@ impl MetalAtlas {
 
     #[cfg(test)]
     pub(crate) fn flush_pending_uploads(&self) {
-        let command_queue = self.0.lock().command_queue.0.clone();
+        let command_queue = self.0.lock().backend.command_queue.0.clone();
         let command_buffer = command_queue.new_command_buffer().to_owned();
         self.encode_pending_uploads(&command_buffer);
         command_buffer.commit();
@@ -757,11 +757,13 @@ mod tests {
             height: DevicePixels(32),
         };
 
-        let first = insert_tile(&atlas, &make_dynamic_texture_key(1), size);
-        let second = insert_tile(&atlas, &make_dynamic_texture_key(2), size);
+        let first = insert_tile(&atlas, make_dynamic_texture_key(1), size);
+        let second = insert_tile(&atlas, make_dynamic_texture_key(2), size);
 
         assert_ne!(first.texture_id, second.texture_id);
-        let first_texture = atlas.metal_texture(first.texture_id);
+        let first_texture = atlas
+            .metal_texture(first.texture_id)
+            .expect("texture should exist while tiles reference it");
         assert_eq!(first_texture.width(), 64);
         assert_eq!(first_texture.height(), 32);
         assert_eq!(atlas.resource_generation(), 0);
@@ -777,7 +779,7 @@ mod tests {
             height: DevicePixels(2),
         };
         let key = make_dynamic_texture_key(3);
-        let tile = insert_tile(&atlas, &key, size);
+        let tile = insert_tile(&atlas, key.clone(), size);
         let dirty_pixel = [1, 2, 3, 4];
 
         atlas
@@ -797,7 +799,9 @@ mod tests {
         // Uploads are applied by the next frame's command buffer.
         atlas.flush_pending_uploads();
 
-        let texture = atlas.metal_texture(tile.texture_id);
+        let texture = atlas
+            .metal_texture(tile.texture_id)
+            .expect("texture should exist while tiles reference it");
         let mut uploaded = [0u8; 16];
         texture.get_bytes(
             uploaded.as_mut_ptr().cast(),
