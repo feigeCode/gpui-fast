@@ -189,3 +189,20 @@ such effect.
 sampling process CPU, the GPU's utilization, power and performance state
 (`nvidia-smi`) and the renderer's statistics. See `script/measure-adaptive
 --help`.
+
+### First real-window results
+
+Wayland (Hyprland), RTX 3060 Ti, 4K at scale 1.6, native presenter,
+`GPUI_RENDER_STATS=1`, the workspace window:
+
+| Scenario   | CPU frames | Region per frame | CPU ms per frame | GPU frames |
+|------------|-----------:|-----------------:|-----------------:|-----------:|
+| CaretBlink | all        | ~52 px           | 0.03–0.04        | 0          |
+| Clock      | all        | ~180–370 px      | 0.03–0.05        | 0          |
+| Quotes     | all        | ~8–17 Kpx        | 0.01–0.03        | 0          |
+
+The first CPU frame after GPU frames draws the canvas whole (3.9 Mpx, about
+9.7 ms). Bursts that change the window whole, such as moving between
+scenarios, go to the GPU (`why_whole_in_burst`). The full
+`script/measure-adaptive` comparison (process CPU, GPU power and P-state)
+is still to be run.
