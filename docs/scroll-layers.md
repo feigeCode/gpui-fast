@@ -42,6 +42,22 @@ drawing as it does without layers, and how to verify and measure layers.
     tiles are hashed once, when it is painted. A frame adding a row hands the
     renderer the other rows as they were and rasterizes only the tiles the
     new row reaches. Rows past the overscan are dropped a batch at a time.
+  - The first frame painting a `list`'s layer paints the whole overscan. A
+    frame painting it afresh after that, for a change of its content, paints
+    only the rows the list shows, as the list does without a layer; the frames
+    that keep the rows then grow the overscan back half a viewport a frame on
+    each side. A view holding the list that is notified now and then, as a chat
+    transcript is when it reaches its end, does not rebuild five viewports of
+    rows each time.
+  - A view holding a `list` that asks only whether the list is scrolled to its
+    end (`ListState::is_scrolled_to_end`) as it renders, as a chat transcript
+    does to show a "back to bottom" button, is taken to have read only that:
+    a scroll that leaves the answer as it was does not change what the view
+    renders, and the layer is composited. Reading the list's offset itself
+    (`logical_scroll_top`, `scroll_px_offset_for_scrollbar`, ...) as it renders
+    keeps the list off its layer. `ListState::scroll_to_end` on a list already
+    at its end, as a view keeping its list there calls on every render,
+    changes nothing.
 - `GPUI_SCROLL_LAYERS=0` turns layers off for a process.
   `Window::set_scroll_layers` does the same for one window in tests.
 
@@ -80,21 +96,48 @@ changes and input rebuilds count too. The initial cache build is excluded, and
 a quarter of each frame's budget is reserved for cache bookkeeping and tile
 rendering. A layer whose estimated work reaches direct drawing's budget falls
 back even if updates occur on fewer than half the frames. Two content refreshes
-that each rebuild more than two visible regions also trigger fallback, without
-waiting for the average: rare broad updates must not keep causing latency
-spikes. One isolated update and the initial cache build are not enough to
-trigger this guard.
+that each rebuild more than two visible regions within 120 frames of each other
+also trigger fallback, without waiting for the average: broad updates must not
+keep causing latency spikes. Refreshes further apart than that are paid back by
+the frames composited between them. One isolated update and the initial cache
+build are not enough to trigger this guard.
 
 Demotion releases cached rows and resets the fixed-size work history. The
 first cooldown requires 60 stable frames; repeated demotions double that wait,
 up to 1920 frames, so periodic refreshes do not keep rebuilding and discarding
-the cache. Updates during cooldown restart its full wait. After 1920 quiet
-frames the backoff resets. This is a work estimate, not a measurement of GPU
+the cache. An update during cooldown asks for 60 more stable frames from it,
+so a view notified every few seconds gets its layer back between
+notifications. A repaint for a change that left every row it painted as the
+layer held it does not count as a changed frame. After 1920 quiet frames the
+backoff resets. This is a work estimate, not a measurement of GPU
 time, and does not depend on the monitor's refresh rate.
 
 Paths are never rasterized into tiles, because odd translations change their
 antialiasing. When nothing covers them, they are drawn over the tiles in the
 frame.
+
+### Changes inside a list's rows
+
+A virtual list's layer keeps what each row read apart from what the list read
+besides (`fast::layers::lists`). While a row renders, is laid out, prepainted
+and painted, the entities it reads are logged under it; the record keeps only
+what the rest of the list read. A frame that finds a row's reads changed, or a
+view drawn in it notified, still composites: it renders that row again, alone,
+as it does a row whose hover changed. A row the list only measured, without
+prepainting it, is not the layer's, and nothing it read is kept.
+
+When the view holding a `list` renders again for something the layer cannot
+tell apart (a notification, a change of what it read itself), it may hand the
+list a different row renderer. The frame still composites: the list renders
+the rows it shows again, and every other row the layer holds is marked suspect
+and rendered again before it shows. A list whose item count changed is
+painted afresh instead, as its rows moved to other indices.
+
+Rows keep their layout nodes: each row the layer holds keeps the keys its
+layout claimed (and only its own, though a `list` lays out every row it shows
+before it prepaints the first), and a row's nodes outlive it for 240 frames
+after it leaves, so scrolling back over it reuses them and the measurements
+they carry instead of shaping its text again.
 
 ## Keeping pixels and coordinates true
 
@@ -147,6 +190,22 @@ pointer over the content. Linux, release build, retained views on, 300 frames:
 | `scroll-same-view` | 0.578 ms, 8.59M instructions | 0.232 ms, 3.19M instructions |
 | `scroll-uniform-list` | 0.397 ms, 5.36M instructions | 0.137 ms, 1.62M instructions |
 | `scroll-list` | 0.377 ms, 5.11M instructions | 0.147 ms, 1.70M instructions |
+
+The chat scenarios, macOS (Apple silicon), release build, retained views on,
+300 frames:
+
+| Scenario | Layers off | Layers on |
+|---|---|---|
+| `chat-scroll` | 0.250 ms, 3.58M instructions | 0.090 ms, 1.22M instructions |
+| `chat-scroll-no-button` | 0.249 ms, 3.56M instructions | 0.093 ms, 1.21M instructions |
+
+`chat-scroll` scrolls a transcript of 160 messages, each body a view of its
+own holding paragraphs, code blocks and tables, away from its end and back,
+while the view holding it follows the end, asks whether the list is at its
+end and fades a "back to bottom" button in and out. Before the list's layer
+told a read of only that from a read of its offset, and painted only the rows
+shown when the view was notified, the layer was composited on none of these
+frames (0.262 ms, 3.60M instructions), and `chat-scroll-no-button` on 80 % of them (0.137 ms, 1.81M).
 
 Every scenario composited its layer on all scrolled frames. In the list
 scenarios the pointer stays over the rows, 40 px of wheel a frame over rows

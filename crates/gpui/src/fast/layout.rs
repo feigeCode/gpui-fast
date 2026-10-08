@@ -73,7 +73,18 @@ pub(crate) struct LayoutRetention {
     /// computations so that its table is not allocated for each one. See
     /// [`settle_measured_leaves`].
     pub(crate) measured_leaves: MeasuredLeaves,
+    /// Measured nodes given a new closure this frame and left clean for what
+    /// their [`MeasureLog`] vouches for, to be measured with it before they
+    /// are laid out. See [`replay_pending_measures`].
+    pending_replays: Vec<(LayoutId, Rc<MeasureLog>)>,
+    /// How many list rows are being laid out, nested. See
+    /// [`RetainedNode::lingers`].
+    list_rows: usize,
 }
+
+/// How many frames a node of a list row is kept unclaimed before it is
+/// released. See [`RetainedNode::lingers`].
+const LIST_ROW_NODE_LINGER_FRAMES: u64 = 240;
 
 /// The leaves a layout computation measured, each with the width it was last
 /// measured at: the width it was given, or the definite width it was offered,
@@ -215,6 +226,12 @@ struct RetainedNode {
     /// The sizes Taffy has taken from the node since it was last dirtied,
     /// for a new measurement to be checked against. See [`MeasureLog`].
     measure_log: Option<Rc<MeasureLog>>,
+    /// Whether the node was last claimed laying out a list row, and is kept
+    /// for [`LIST_ROW_NODE_LINGER_FRAMES`] after it goes unclaimed. A list
+    /// lays out only the rows it shows, or, on a scroll layer, those it
+    /// paints ahead of the viewport, so a row scrolled out and back in again
+    /// would otherwise be laid out, and its text shaped, from scratch.
+    lingers: bool,
 }
 
 /// The measurements Taffy took of one measured node since the node was last
@@ -295,6 +312,12 @@ impl MeasureLog {
             })
     }
 
+    /// Whether the log holds every size Taffy took from its node since the
+    /// node was last dirtied: it has some, and did not give up recording.
+    fn vouches(&self) -> bool {
+        !self.overflowed.get() && !self.entries.borrow().is_empty()
+    }
+
     /// `measure`, boxed for a node, recording what it measures into `log`.
     fn logged(
         log: &Rc<MeasureLog>,
@@ -366,6 +389,7 @@ impl TaffyLayoutEngine {
             return Claim::Unkeyed;
         }
         node.claimed_in_frame = frame;
+        node.lingers = retention.list_rows > 0;
         retention.claimed_this_frame += 1;
         retention.stats.nodes_reused += 1;
         if retention.open_key_recordings > 0 {
@@ -454,6 +478,23 @@ impl TaffyLayoutEngine {
             .collect()
     }
 
+    /// Whether computing layout at `root` reaches `id`. Element ancestry
+    /// does not imply layout ancestry: list items and other children placed
+    /// with `prepaint_as_root` belong to separate Taffy trees.
+    pub(crate) fn layout_reaches(&self, root: LayoutId, id: LayoutId) -> bool {
+        let root = root.into();
+        let mut node = id.into();
+        loop {
+            if node == root {
+                return true;
+            }
+            let Some(parent) = self.taffy.parent(node) else {
+                return false;
+            };
+            node = parent;
+        }
+    }
+
     /// Whether the nodes [`Self::retained_layouts`] returned still have the
     /// layouts they had then.
     pub(crate) fn layouts_unchanged(&self, layouts: &[(LayoutId, taffy::Layout)]) -> bool {
@@ -537,6 +578,7 @@ impl TaffyLayoutEngine {
                 style_fingerprint,
                 measurement: None,
                 measure_log: None,
+                lingers: retention.list_rows > 0,
             },
         );
         retention.claimed_this_frame += 1;
@@ -745,13 +787,16 @@ impl TaffyLayoutEngine {
         };
         let log = Rc::<MeasureLog>::default();
         let measure = MeasureLog::logged(&log, measure);
-        let id = request_retained_measured_layout(
+        // Measured afresh: what the last element measured was forgotten, and
+        // measuring under its constraints again would put it back.
+        let id = request_measured_node(
             self,
             key,
             &Style::default(),
             rem_size,
             scale_factor,
             measure,
+            false,
         );
         if let Some(node) = key.and_then(|key| self.retention.retained.get_mut(&key))
             && node.id == id
@@ -828,6 +873,11 @@ impl TaffyLayoutEngine {
 /// the tree that did not change.
 #[inline]
 pub(crate) fn release_unclaimed_nodes(engine: &mut TaffyLayoutEngine) {
+    // A measured node left clean but not laid out this frame is measured
+    // afresh the next time it is.
+    for (id, _) in mem::take(&mut engine.retention.pending_replays) {
+        let _ = engine.taffy.mark_dirty(id.into());
+    }
     let retention = &mut engine.retention;
     retention.stats.frames += 1;
 
@@ -845,7 +895,9 @@ pub(crate) fn release_unclaimed_nodes(engine: &mut TaffyLayoutEngine) {
         let unstretched_styles = &mut retention.unstretched_styles;
         let freed = &mut retention.stats.nodes_freed;
         retention.retained.retain(|_, node| {
-            if node.claimed_in_frame == frame {
+            if node.claimed_in_frame == frame
+                || node.lingers && frame - node.claimed_in_frame < LIST_ROW_NODE_LINGER_FRAMES
+            {
                 return true;
             }
             unstretched_styles.remove(&node.id);
@@ -959,7 +1011,11 @@ pub(crate) fn request_retained_layout(
 /// [`TaffyLayoutEngine::request_measured_layout`].
 ///
 /// Nothing says what the measurement depends on, so a reused node is given
-/// the new closure and dirtied, and `measure` is guaranteed to run.
+/// the new closure, and `measure` is guaranteed to run: before the node is
+/// laid out, under every constraint Taffy measured the node under since it
+/// was last dirtied, when its [`MeasureLog`] holds them all, and the node is
+/// dirtied only if a size comes out different (see
+/// [`replay_pending_measures`]); as Taffy lays it out otherwise.
 #[inline]
 pub(crate) fn request_retained_measured_layout(
     engine: &mut TaffyLayoutEngine,
@@ -975,10 +1031,43 @@ pub(crate) fn request_retained_measured_layout(
     ) -> Size<Pixels>
     + 'static,
 ) -> LayoutId {
-    let measure = Box::new(measure) as Box<MeasureFn>;
+    request_measured_node(engine, key, style, rem_size, scale_factor, measure, true)
+}
+
+/// [`request_retained_measured_layout`], checking a reused node's new closure
+/// against its [`MeasureLog`] only when `replay`.
+fn request_measured_node(
+    engine: &mut TaffyLayoutEngine,
+    key: Option<u64>,
+    style: &Style,
+    rem_size: Pixels,
+    scale_factor: f32,
+    measure: impl FnMut(
+        Size<Option<Pixels>>,
+        Size<AvailableSpace>,
+        &mut Window,
+        &mut App,
+    ) -> Size<Pixels>
+    + 'static,
+    replay: bool,
+) -> LayoutId {
+    engine.retention.stats.measure_rebinds += 1;
+    // What the node measured since it was last dirtied, if it can vouch for
+    // it: the new closure is then checked against it before the node is laid
+    // out, rather than the node dirtied now.
+    let vouching = match &key {
+        Some(key) if replay => engine
+            .retention
+            .retained
+            .get(key)
+            .and_then(|node| node.measure_log.clone())
+            .filter(|log| log.vouches()),
+        _ => None,
+    };
+    let log = vouching.clone().unwrap_or_default();
+    let measure = MeasureLog::logged(&log, measure);
     #[cfg(feature = "stacker")]
     let measure = crate::taffy::StackSafe::new(measure);
-    engine.retention.stats.measure_rebinds += 1;
 
     let (key, id) = match engine.claim(key) {
         Claim::Reused(key, id) => (key, id),
@@ -997,6 +1086,11 @@ pub(crate) fn request_retained_measured_layout(
                 .expect(EXPECT_MESSAGE)
                 .into();
             engine.retain(key, id, &[], true, style_fingerprint);
+            if let Some(node) = key.and_then(|key| engine.retention.retained.get_mut(&key))
+                && node.id == id
+            {
+                node.measure_log = Some(log);
+            }
             return id;
         }
     };
@@ -1006,7 +1100,8 @@ pub(crate) fn request_retained_measured_layout(
 
     // Nothing says whether the measurement still stands, and what it
     // produces lives in state the element made afresh this frame, so it
-    // has to be taken again.
+    // has to be taken again: before the node is laid out, against what it
+    // measured before, when that is known, or as Taffy lays it out.
     engine.retention.remeasures += 1;
     if let Some(context) = engine.taffy.get_node_context_mut(id.into()) {
         context.measure = measure;
@@ -1016,7 +1111,10 @@ pub(crate) fn request_retained_measured_layout(
             .set_node_context(id.into(), Some(NodeContext { measure }))
             .expect(EXPECT_MESSAGE);
     }
-    engine.taffy.mark_dirty(id.into()).expect(EXPECT_MESSAGE);
+    match vouching {
+        Some(log) => engine.retention.pending_replays.push((id, log)),
+        None => engine.taffy.mark_dirty(id.into()).expect(EXPECT_MESSAGE),
+    }
     let node = engine
         .retention
         .retained
@@ -1024,9 +1122,67 @@ pub(crate) fn request_retained_measured_layout(
         .expect("a claimed key is always present");
     node.measured = true;
     node.measurement = None;
-    node.measure_log = None;
+    node.measure_log = Some(log);
 
     id
+}
+
+/// Measures, with the closures they were given this frame, the measured
+/// nodes [`request_retained_measured_layout`] left clean, under every
+/// constraint their [`MeasureLog`] holds, dirtying those whose size came out
+/// different under any of them. Called before a layout is computed, as the
+/// closures need the window to measure.
+///
+/// A node every one of whose sizes stands keeps what Taffy cached for it and
+/// for the nodes above it: a list row whose text is laid out again, as it is
+/// on every frame the row is built, is not laid out afresh. The measurements
+/// are taken in the order they were last taken, so what the element keeps of
+/// them is what the last one left, as it would be had Taffy taken them.
+pub(crate) fn replay_pending_measures(
+    engine: &mut TaffyLayoutEngine,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if engine.retention.pending_replays.is_empty() {
+        return;
+    }
+    let pending = mem::take(&mut engine.retention.pending_replays);
+    for (id, log) in &pending {
+        let entries = log.entries.borrow().clone();
+        let Some(context) = engine.taffy.get_node_context_mut((*id).into()) else {
+            continue;
+        };
+        let stands = entries.iter().all(|(known, available, size)| {
+            engine.retention.stats.measure_calls += 1;
+            (context.measure)(*known, *available, window, cx) == *size
+        });
+        if stands {
+            engine.retention.stats.measurements_replayed += 1;
+            // What the element keeps is what the last measurement left; the
+            // node is measured again at the width it is laid out at, should
+            // that be another, once the layout is computed.
+            if let Some((known, available, _)) = entries.last() {
+                engine
+                    .retention
+                    .measured_leaves
+                    .note((*id).into(), *known, *available);
+            }
+        } else {
+            engine.retention.layout_changes += 1;
+            engine.taffy.mark_dirty((*id).into()).expect(EXPECT_MESSAGE);
+        }
+    }
+    engine.retention.pending_replays = pending;
+    engine.retention.pending_replays.clear();
+}
+
+/// Runs `f`, laying out a list row: the nodes it claims linger. See
+/// [`RetainedNode::lingers`].
+pub(crate) fn laying_out_list_row<R>(window: &mut Window, f: impl FnOnce(&mut Window) -> R) -> R {
+    window.layout_engine.as_mut().unwrap().retention.list_rows += 1;
+    let result = f(window);
+    window.layout_engine.as_mut().unwrap().retention.list_rows -= 1;
+    result
 }
 
 /// Treats any `auto` dimension of the given node's style as filling `size`.
