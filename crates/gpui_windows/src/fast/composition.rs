@@ -90,7 +90,35 @@ struct PortalState {
     bounds: Cell<Bounds<DevicePixels>>,
     parent_origin: Cell<Point<DevicePixels>>,
     visible: Cell<bool>,
+    // A window whose rasterization is composed by this portal. The wrapper
+    // surface has to outlive the attachment, so it is kept here until the
+    // portal is rebound or dropped.
+    window_content: RefCell<Option<ComposedWindowContent>>,
     compositor_recreated_callback: RefCell<Option<Rc<dyn Fn(Box<dyn Any>) -> Result<()>>>>,
+}
+
+struct ComposedWindowContent {
+    handle: HWND,
+    // Kept alive for the lifetime of the attachment; the compositor stops
+    // composing the window once this wrapper goes away.
+    #[allow(dead_code)]
+    surface: IUnknown,
+}
+
+/// Wraps `handle`'s rasterization into a composition surface and attaches it to
+/// the portal visual.
+///
+/// `handle` must reference a layered window; DirectComposition drops the content
+/// of a window that loses `WS_EX_LAYERED`.
+fn attach_window_content(state: &PortalState, handle: HWND) -> Result<()> {
+    let surface = unsafe { state.comp_device.CreateSurfaceFromHwnd(handle) }
+        .context("creating a composition surface from a window handle")?;
+    unsafe {
+        state.visual.SetContent(&surface)?;
+        state.comp_device.Commit()?;
+    }
+    *state.window_content.borrow_mut() = Some(ComposedWindowContent { handle, surface });
+    Ok(())
 }
 
 /// Forwarded to by `WindowsWindow::draw_composed`.
@@ -492,6 +520,7 @@ impl PortalState {
             bounds: Cell::new(Bounds::default()),
             parent_origin: Cell::new(Point::default()),
             visible: Cell::new(true),
+            window_content: RefCell::new(None),
             compositor_recreated_callback: RefCell::new(None),
         })
     }
@@ -503,6 +532,7 @@ impl PortalState {
         let parent_origin = state.parent_origin.get();
         let visible = state.visible.get();
         let compositor_recreated_callback = state.compositor_recreated_callback.borrow().clone();
+        let window_content = state.window_content.borrow().as_ref().map(|content| content.handle);
         let replacement = Self::new(comp_device)?;
         let x = (bounds.origin.x - parent_origin.x).0 as f32;
         let y = (bounds.origin.y - parent_origin.y).0 as f32;
@@ -523,6 +553,9 @@ impl PortalState {
         replacement.bounds.set(bounds);
         replacement.parent_origin.set(parent_origin);
         replacement.visible.set(visible);
+        if let Some(handle) = window_content {
+            attach_window_content(&replacement, handle)?;
+        }
         *replacement.compositor_recreated_callback.borrow_mut() = compositor_recreated_callback;
         *state = replacement;
         Ok(())
@@ -605,6 +638,18 @@ impl PlatformSurfaceAttachment for Portal {
 
     fn platform_handle(&self) -> Result<Box<dyn Any>> {
         Ok(Box::new(self.state.borrow().visual.cast::<IUnknown>()?))
+    }
+
+    fn set_window_content(&self, content: Box<dyn Any>) -> Result<()> {
+        // The window handle travels as a `usize`, matching the convention
+        // `platform_handle` uses for raw platform pointers: a consumer rarely
+        // depends on the exact `windows` crate version this crate was built
+        // against, so a typed `HWND` would not downcast across crate versions.
+        let window = content
+            .downcast::<usize>()
+            .map_err(|_| anyhow::anyhow!("composition window content must be a window handle"))?;
+        let state = self.state.borrow();
+        attach_window_content(&state, HWND(*window as *mut _))
     }
 }
 

@@ -325,6 +325,18 @@ pub trait PlatformSurfaceAttachment {
     }
     /// Updates whether the native surface participates in composition.
     fn set_visible(&self, visible: bool) -> Result<()>;
+    /// Composes the rasterization of an existing platform window as this
+    /// surface's content.
+    ///
+    /// `content` is the raw window handle as a `usize`, the same convention
+    /// `platform_handle` uses for raw platform pointers. The window has to be
+    /// one the platform compositor can wrap: Windows requires `WS_EX_LAYERED`,
+    /// and callers normally hide the original window with `DWMWA_CLOAK` once
+    /// its content is composed here. Platforms that cannot host an existing
+    /// window inside a composed surface return an error.
+    fn set_window_content(&self, _content: Box<dyn Any>) -> Result<()> {
+        bail!("composing an existing window into a surface is not supported by this platform")
+    }
     /// Returns the platform attachment object: an `NSView` pointer as `usize`
     /// on macOS, an `IDCompositionVisual` as `windows::core::IUnknown` on
     /// Windows, a `raw_window_handle::RawWindowHandle` on Linux.
