@@ -616,6 +616,10 @@ impl PlatformSurfaceAttachment for ManagedPlatformSurface {
         self.platform_surface.set_visible(visible)
     }
 
+    fn set_window_content(&self, content: Box<dyn Any>) -> Result<()> {
+        self.platform_surface.set_window_content(content)
+    }
+
     fn platform_handle(&self) -> Result<Box<dyn Any>> {
         self.platform_surface.platform_handle()
     }

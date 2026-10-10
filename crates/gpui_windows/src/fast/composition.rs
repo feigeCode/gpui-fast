@@ -121,6 +121,34 @@ fn attach_window_content(state: &PortalState, handle: HWND) -> Result<()> {
     Ok(())
 }
 
+/// Mirrors `visible` onto a portal visual.
+///
+/// The opacity setters live on `IDCompositionVisual3`, but only the visuals of a
+/// device created by `DCompositionCreateDevice3` implement that interface — the
+/// device GPUI creates is the v1 one, whose visuals stop at
+/// `IDCompositionVisual`. Casting there returns `E_NOINTERFACE`
+/// (`0x80004002`), which used to fail every visibility change and, through the
+/// callers that treat a failed hide as "this surface is unusable", retired an
+/// otherwise working composition surface.
+///
+/// A portal presents `window_content`, so attaching and detaching that content
+/// says the same thing on a device of any version: a portal with no content
+/// rasterizes nothing.
+fn apply_portal_visibility(state: &PortalState, visible: bool) -> Result<()> {
+    if let Ok(visual3) = state.visual.cast::<IDCompositionVisual3>() {
+        unsafe { visual3.SetOpacity2(if visible { 1.0 } else { 0.0 }) }?;
+        return Ok(());
+    }
+    match (visible, state.window_content.borrow().as_ref()) {
+        (true, Some(content)) => unsafe { state.visual.SetContent(&content.surface) }
+            .context("restoring the composed window content"),
+        // Nothing is presented either way, so there is nothing to toggle off.
+        (true, None) => Ok(()),
+        (false, _) => unsafe { state.visual.SetContent(None::<&windows::core::IUnknown>) }
+            .context("detaching the composed window content"),
+    }
+}
+
 /// Forwarded to by `WindowsWindow::draw_composed`.
 pub(crate) fn draw_composed(window: &WindowsWindow, scene: ComposedScene<'_>) {
     let background_appearance = window.state.background_appearance.get();
@@ -545,17 +573,19 @@ impl PortalState {
             replacement.clip.SetTop2(0.0)?;
             replacement.clip.SetRight2(width)?;
             replacement.clip.SetBottom2(height)?;
-            replacement
-                .visual
-                .cast::<IDCompositionVisual3>()?
-                .SetOpacity2(if visible { 1.0 } else { 0.0 })?;
         }
         replacement.bounds.set(bounds);
         replacement.parent_origin.set(parent_origin);
-        replacement.visible.set(visible);
+        // Content before visibility: hiding is defined as "no content", so
+        // reattaching the composed window first lets a hidden portal stay hidden.
         if let Some(handle) = window_content {
             attach_window_content(&replacement, handle)?;
         }
+        apply_portal_visibility(&replacement, visible)?;
+        unsafe {
+            replacement.comp_device.Commit()?;
+        }
+        replacement.visible.set(visible);
         *replacement.compositor_recreated_callback.borrow_mut() = compositor_recreated_callback;
         *state = replacement;
         Ok(())
@@ -599,11 +629,8 @@ impl PlatformSurfaceAttachment for Portal {
     fn set_visible(&self, visible: bool) -> Result<()> {
         let state = self.state.borrow();
         if state.visible.get() != visible {
+            apply_portal_visibility(&state, visible)?;
             unsafe {
-                state
-                    .visual
-                    .cast::<IDCompositionVisual3>()?
-                    .SetOpacity2(if visible { 1.0 } else { 0.0 })?;
                 state.comp_device.Commit()?;
             }
             state.visible.set(visible);
