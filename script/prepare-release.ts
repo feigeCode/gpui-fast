@@ -187,7 +187,13 @@ export function prepare(config: ReleaseConfig, version: string, dest = DEST): vo
     const target = resolve(dest, name);
     mkdirSync(target, { recursive: true });
     const fastPackage = fastName(spec.forwards);
-    const featureTable: Record<string, string[]> = { default: ["gpui_fast/default"], ...spec.features };
+    // `default` only forwards when the target crate has a default feature to
+    // receive it (leaf crates like gpui_util have no feature table at all).
+    const featureTable: Record<string, string[]> = { ...spec.features };
+    if (spec.forwards === "gpui" || spec.forwards === "gpui_platform" || spec.forwards === "sum_tree" || spec.forwards === "reqwest_client") {
+      featureTable.default = ["gpui_fast/default"];
+    }
+    if (!Object.keys(featureTable).length) featureTable.default = [];
     writeFileSync(resolve(target, "Cargo.toml"), "# Modified by Longbridge for gpui-fast publication.\n" + Bun.TOML.stringify({
       package: {
         name, version: "0.3.126", license: "Apache-2.0", edition: workspace.package.edition,
