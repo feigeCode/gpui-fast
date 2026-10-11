@@ -1262,6 +1262,14 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    /// Whether the most recently drawn frame painted deferred content.
+    ///
+    /// Deferred content is what GPUI draws above the ordinary element tree —
+    /// popup menus, context menus and prompts. Hosts that compose a native child
+    /// window into the window's visual tree use this to tell when their content
+    /// has to yield to the overlay layer, which normal element-tree content
+    /// cannot express.
+    deferred_content_present: bool,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -2277,6 +2285,7 @@ impl Window {
             focused_text_input_active: false,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            deferred_content_present: false,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -3783,6 +3792,13 @@ impl Window {
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
         self.prepaint_deferred_draws(cx);
+        // Deferred draws for this frame are all collected by now
+        // (`prepaint_deferred_draws` takes elements out of the entries without
+        // removing them, so the length still reflects this frame's overlay
+        // content); the prompt is drawn by the window itself and does not go
+        // through `deferred_draws`, so it counts separately.
+        self.deferred_content_present =
+            !self.next_frame.deferred_draws.is_empty() || self.prompt.is_some();
 
         let mut prompt_element = None;
         let mut active_drag_element = None;
@@ -6878,6 +6894,16 @@ impl Window {
     /// [`App::set_prompt_builder`]), not for platform-native prompt dialogs.
     pub fn has_active_prompt(&self) -> bool {
         self.prompt.is_some()
+    }
+
+    /// Returns whether the most recently drawn frame painted deferred content.
+    ///
+    /// Deferred content is what GPUI draws above the ordinary element tree:
+    /// popup menus, context menus and prompts. Hosts that compose a native
+    /// child window into the window's visual tree use this to tell when their
+    /// content has to yield to the overlay layer.
+    pub fn has_deferred_content(&self) -> bool {
+        self.deferred_content_present
     }
 
     /// Returns the current context stack.
