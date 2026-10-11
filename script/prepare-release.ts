@@ -59,8 +59,51 @@ export function prepare(config: ReleaseConfig, version: string, dest = DEST): vo
   const workspace = readToml(resolve(ROOT, "Cargo.toml")).workspace;
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(dest, { recursive: true });
+  // gpui-pre compatibility shims: same names and versions as the crates.io
+  // gpui-pre snapshots GPUI Kit pins, forwarding to the sibling gpui-fast
+  // crates in this release. Consumers patch these over crates-io and the
+  // whole kit graph compiles against this repository's gpui.
+  const compat: Record<string, { forwards: string; features: Record<string, string[]> }> = {
+    "gpui-pre": { forwards: "gpui", features: {
+      bench: ["gpui_fast/bench"], "bench-support": ["gpui_fast/bench-support"],
+      inspector: ["gpui_fast/inspector"], "leak-detection": ["gpui_fast/leak-detection"],
+      profiler: ["gpui_fast/profiler"], "screen-capture": ["gpui_fast/screen-capture"],
+      stacker: ["gpui_fast/stacker"], "test-support": ["gpui_fast/test-support"],
+      wayland: ["gpui_fast/wayland"], "windows-manifest": ["gpui_fast/windows-manifest"],
+      x11: ["gpui_fast/x11"],
+    } },
+    "gpui-pre-macros": { forwards: "gpui_macros", features: { inspector: ["gpui_fast/inspector"] } },
+    "gpui-pre-platform": { forwards: "gpui_platform", features: {
+      "bench-support": ["gpui_fast/bench-support"], "font-kit": ["gpui_fast/font-kit"],
+      runtime_shaders: ["gpui_fast/runtime_shaders"], "screen-capture": ["gpui_fast/screen-capture"],
+      "test-support": ["gpui_fast/test-support"], wayland: ["gpui_fast/wayland"], x11: ["gpui_fast/x11"],
+    } },
+    "gpui-pre-sum-tree": { forwards: "sum_tree", features: { "test-support": ["gpui_fast/test-support"] } },
+    "gpui-pre-reqwest-client": { forwards: "reqwest_client", features: {} },
+    "gpui-pre-util": { forwards: "gpui_util", features: {} },
+    // Platform and remaining snapshot crates: cover every gpui-pre-* name the
+    // fork published so no crates.io gpui-pre-* crate (whose internal =0.3.8
+    // pins would conflict with the 0.3.126 shims) is ever selected.
+    "gpui-pre-apple": { forwards: "gpui_apple", features: {} },
+    "gpui-pre-linux": { forwards: "gpui_linux", features: {} },
+    "gpui-pre-macos": { forwards: "gpui_macos", features: {} },
+    "gpui-pre-windows": { forwards: "gpui_windows", features: {} },
+    "gpui-pre-wgpu": { forwards: "gpui_wgpu", features: {} },
+    "gpui-pre-web": { forwards: "gpui_web", features: {} },
+    "gpui-pre-bench-metrics": { forwards: "bench_metrics", features: {} },
+    "gpui-pre-collections": { forwards: "collections", features: {} },
+    "gpui-pre-derive-refineable": { forwards: "refineable/derive_refineable", features: {} },
+    "gpui-pre-refineable": { forwards: "refineable", features: {} },
+    "gpui-pre-http-client": { forwards: "http_client", features: {} },
+    "gpui-pre-http-client-tls": { forwards: "http_client_tls", features: {} },
+    "gpui-pre-scheduler": { forwards: "scheduler", features: {} },
+    "gpui-pre-shared-string": { forwards: "gpui_shared_string", features: {} },
+    "gpui-pre-zlog": { forwards: "zlog", features: {} },
+    "gpui-pre-ztracing": { forwards: "ztracing", features: {} },
+    "gpui-pre-ztracing-macro": { forwards: "ztracing_macro", features: {} },
+  };
   writeFileSync(resolve(dest, "Cargo.toml"), Bun.TOML.stringify({
-    workspace: { resolver: "2", members: config.crates },
+    workspace: { resolver: "2", members: [...config.crates, ...Object.keys(compat)] },
   }));
   cpSync(resolve(ROOT, "rust-toolchain.toml"), resolve(dest, "rust-toolchain.toml"));
 
@@ -160,37 +203,17 @@ export function prepare(config: ReleaseConfig, version: string, dest = DEST): vo
     + original.replace(needle, '.join("src/fast/release_gpui")'));
 
   // Apache-2.0 section 4(b) requires change notices in distributed copies.
-  // gpui-pre compatibility shims: same names and versions as the crates.io
-  // gpui-pre snapshots GPUI Kit pins, forwarding to the sibling gpui-fast
-  // crates in this release. Consumers patch these over crates-io and the
-  // whole kit graph compiles against this repository's gpui.
-  const compat: Record<string, { forwards: string; features: Record<string, string[]> }> = {
-    "gpui-pre": { forwards: "gpui", features: {
-      bench: ["gpui_fast/bench"], "bench-support": ["gpui_fast/bench-support"],
-      inspector: ["gpui_fast/inspector"], "leak-detection": ["gpui_fast/leak-detection"],
-      profiler: ["gpui_fast/profiler"], "screen-capture": ["gpui_fast/screen-capture"],
-      stacker: ["gpui_fast/stacker"], "test-support": ["gpui_fast/test-support"],
-      wayland: ["gpui_fast/wayland"], "windows-manifest": ["gpui_fast/windows-manifest"],
-      x11: ["gpui_fast/x11"],
-    } },
-    "gpui-pre-macros": { forwards: "gpui_macros", features: { inspector: ["gpui_fast/inspector"] } },
-    "gpui-pre-platform": { forwards: "gpui_platform", features: {
-      "bench-support": ["gpui_fast/bench-support"], "font-kit": ["gpui_fast/font-kit"],
-      runtime_shaders: ["gpui_fast/runtime_shaders"], "screen-capture": ["gpui_fast/screen-capture"],
-      "test-support": ["gpui_fast/test-support"], wayland: ["gpui_fast/wayland"], x11: ["gpui_fast/x11"],
-    } },
-    "gpui-pre-sum-tree": { forwards: "sum_tree", features: { "test-support": ["gpui_fast/test-support"] } },
-    "gpui-pre-reqwest-client": { forwards: "reqwest_client", features: {} },
-    "gpui-pre-util": { forwards: "gpui_util", features: {} },
-  };
   for (const [name, spec] of Object.entries(compat)) {
     const target = resolve(dest, name);
     mkdirSync(target, { recursive: true });
-    const fastPackage = fastName(spec.forwards);
+    const leafName = spec.forwards.split("/").pop()!;
+    const fastPackage = spec.forwards.includes("/")
+      ? leafName.replaceAll("_", "-")
+      : fastName(spec.forwards);
     // `default` only forwards when the target crate has a default feature to
     // receive it (leaf crates like gpui_util have no feature table at all).
     const featureTable: Record<string, string[]> = { ...spec.features };
-    if (spec.forwards === "gpui" || spec.forwards === "gpui_platform" || spec.forwards === "sum_tree") {
+    if (spec.forwards === "gpui" || spec.forwards === "gpui_platform") {
       featureTable.default = ["gpui_fast/default"];
     }
     if (!Object.keys(featureTable).length) featureTable.default = [];
@@ -200,7 +223,7 @@ export function prepare(config: ReleaseConfig, version: string, dest = DEST): vo
         description: `${fastPackage} under the gpui-pre name GPUI Kit pins; forwards to it.`,
         repository: config.repository,
       },
-      lib: { name: spec.forwards, path: "lib.rs", doctest: false },
+      lib: { name: leafName, path: "lib.rs", doctest: false },
       features: featureTable,
       dependencies: { gpui_fast: { package: fastPackage, path: "../" + spec.forwards, "default-features": false } },
     } satisfies Record<string, unknown> as unknown as Manifest));
