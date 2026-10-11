@@ -190,7 +190,7 @@ export function prepare(config: ReleaseConfig, version: string, dest = DEST): vo
     const featureTable: Record<string, string[]> = { default: ["gpui_fast/default"], ...spec.features };
     writeFileSync(resolve(target, "Cargo.toml"), "# Modified by Longbridge for gpui-fast publication.\n" + Bun.TOML.stringify({
       package: {
-        name, version: "0.3.8", license: "Apache-2.0", edition: workspace.package.edition,
+        name, version: "0.3.126", license: "Apache-2.0", edition: workspace.package.edition,
         description: `${fastPackage} under the gpui-pre name GPUI Kit pins; forwards to it.`,
         repository: config.repository,
       },
