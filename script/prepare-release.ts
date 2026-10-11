@@ -190,7 +190,7 @@ export function prepare(config: ReleaseConfig, version: string, dest = DEST): vo
     // `default` only forwards when the target crate has a default feature to
     // receive it (leaf crates like gpui_util have no feature table at all).
     const featureTable: Record<string, string[]> = { ...spec.features };
-    if (spec.forwards === "gpui" || spec.forwards === "gpui_platform" || spec.forwards === "sum_tree" || spec.forwards === "reqwest_client") {
+    if (spec.forwards === "gpui" || spec.forwards === "gpui_platform" || spec.forwards === "sum_tree") {
       featureTable.default = ["gpui_fast/default"];
     }
     if (!Object.keys(featureTable).length) featureTable.default = [];
