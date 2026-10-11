@@ -21,7 +21,7 @@ function snapshotName(name: string): string {
   return "gpui-pre-" + name.replace(/^gpui_/, "").replaceAll("_", "-");
 }
 
-export function dependency(key: string, input: any, workspace: Manifest, config: ReleaseConfig, version: string): any {
+export function dependency(key: string, input: any, workspace: Manifest, config: ReleaseConfig, version: string, crate?: string): any {
   if (typeof input === "string") return input;
   let value = structuredClone(input);
   if (value.workspace) {
@@ -38,10 +38,15 @@ export function dependency(key: string, input: any, workspace: Manifest, config:
     Object.assign(value, config.crates.includes(key)
       ? { package: fastName(key), version: "^" + version, path: "../" + key }
       : { package: snapshotName(key), version: "=" + config.snapshot_version });
+    // A crate listed as "parent/leaf" (e.g. refineable/derive_refineable) is
+    // depended on by its bare leaf key; remap that to the sibling fast crate.
+    if (value.package === snapshotName(key) && crate && config.crates.includes(crate + "/" + key)) {
+      value = { package: fastName(key), version: "^" + version, path: "../" + crate + "/" + key };
+    }
   }
   if ("git" in value) {
     if (!value.version) {
-      if (key !== "proptest") throw new Error(`${key}: Git dependency has no registry version`);
+      if (key !== "proptest" && !(crate === "http_client" && key === "async-tar")) throw new Error(`${key}: Git dependency has no registry version`);
       value.version = "1";
     }
     for (const field of ["git", "rev", "branch", "tag"]) delete value[field];
@@ -62,21 +67,22 @@ export function prepare(config: ReleaseConfig, version: string, dest = DEST): vo
   for (const name of config.crates) {
     const source = resolve(ROOT, "crates", name);
     const target = resolve(dest, name);
+    const leaf = name.split("/").pop()!; // subdir crates publish under their leaf name
     cpSync(source, target, { recursive: true });
     const manifest = readToml(resolve(source, "Cargo.toml"));
     const pkg = manifest.package;
     Object.assign(pkg, {
-      name: fastName(name), version, publish: ["crates-io"],
+      name: fastName(leaf), version, publish: ["crates-io"],
       edition: workspace.package.edition, repository: config.repository,
       homepage: config.homepage, readme: "README.md", license: "Apache-2.0",
-      documentation: `https://docs.rs/${fastName(name)}/${version}/${name}/`,
-      description: `${name}: GPUI with gpui-fast rendering and layout optimizations`,
+      documentation: `https://docs.rs/${fastName(leaf)}/${version}/${leaf}/`,
+      description: `${leaf}: GPUI with gpui-fast rendering and layout optimizations`,
       autoexamples: false, autobenches: false, autotests: false,
       authors: [...new Set([...(pkg.authors ?? []), "Longbridge"])],
       include: ["/src/**", "/resources/**", "/build.rs", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"],
     });
     delete pkg.metadata;
-    manifest.lib.name = name;
+    manifest.lib.name = leaf;
     for (const field of ["lints", "example", "bench", "test", "dev-dependencies"]) delete manifest[field];
     // Published crates have no workspace to inherit lints from; keep its rustc
     // lints so upstream's cfgs, such as `rust_analyzer`, stay allowed.
@@ -85,7 +91,7 @@ export function prepare(config: ReleaseConfig, version: string, dest = DEST): vo
       delete group["dev-dependencies"];
       for (const section of ["dependencies", "build-dependencies"]) {
         if (group[section]) group[section] = Object.fromEntries(
-          Object.entries(group[section]).map(([key, value]) => [key, dependency(key, value, workspace, config, version)]),
+          Object.entries(group[section]).map(([key, value]) => [key, dependency(key, value, workspace, config, version, name)]),
         );
       }
     }
@@ -100,6 +106,27 @@ export function prepare(config: ReleaseConfig, version: string, dest = DEST): vo
       };
       manifest.features["screen-capture"].push("dep:windows-capture");
     }
+    // http_client's `github-download` pulls a git-only async-tar the registry
+    // snapshot cannot express; nothing enables it, so drop it (mirrors the
+    // gpui-pre snapshot, which ships without it).
+    if (name === "http_client" && manifest.features["github-download"]) {
+      for (const dep of manifest.features["github-download"]) {
+        if (dep.startsWith("dep:")) delete manifest.dependencies[dep.slice(4)];
+      }
+      delete manifest.features["github-download"];
+      for (const group of [manifest, ...Object.values(manifest.target ?? {})] as Manifest[]) {
+        for (const section of ["dependencies", "build-dependencies"]) {
+          if (group[section]) {
+            delete group[section]["async-tar"];
+            delete group[section]["util"];
+          }
+        }
+      }
+    }
+    // gpui's `util_macros` is only used inside #[cfg(test)] (the `perf`
+    // attribute); snapshots drop tests, so drop the dependency too. Its
+    // `perf` dependency lives in tooling/, not crates/, and stays out.
+    if (name === "gpui") delete manifest.dependencies["util_macros"];
     writeFileSync(resolve(target, "Cargo.toml"),
       "# Modified by Longbridge for gpui-fast publication.\n" + Bun.TOML.stringify(manifest));
     cpSync(resolve(ROOT, "LICENSE"), resolve(target, "LICENSE"));
@@ -133,6 +160,48 @@ export function prepare(config: ReleaseConfig, version: string, dest = DEST): vo
     + original.replace(needle, '.join("src/fast/release_gpui")'));
 
   // Apache-2.0 section 4(b) requires change notices in distributed copies.
+  // gpui-pre compatibility shims: same names and versions as the crates.io
+  // gpui-pre snapshots GPUI Kit pins, forwarding to the sibling gpui-fast
+  // crates in this release. Consumers patch these over crates-io and the
+  // whole kit graph compiles against this repository's gpui.
+  const compat: Record<string, { forwards: string; features: Record<string, string[]> }> = {
+    "gpui-pre": { forwards: "gpui", features: {
+      bench: ["gpui_fast/bench"], "bench-support": ["gpui_fast/bench-support"],
+      inspector: ["gpui_fast/inspector"], "leak-detection": ["gpui_fast/leak-detection"],
+      profiler: ["gpui_fast/profiler"], "screen-capture": ["gpui_fast/screen-capture"],
+      stacker: ["gpui_fast/stacker"], "test-support": ["gpui_fast/test-support"],
+      wayland: ["gpui_fast/wayland"], "windows-manifest": ["gpui_fast/windows-manifest"],
+      x11: ["gpui_fast/x11"],
+    } },
+    "gpui-pre-macros": { forwards: "gpui_macros", features: { inspector: ["gpui_fast/inspector"] } },
+    "gpui-pre-platform": { forwards: "gpui_platform", features: {
+      "bench-support": ["gpui_fast/bench-support"], "font-kit": ["gpui_fast/font-kit"],
+      runtime_shaders: ["gpui_fast/runtime_shaders"], "screen-capture": ["gpui_fast/screen-capture"],
+      "test-support": ["gpui_fast/test-support"], wayland: ["gpui_fast/wayland"], x11: ["gpui_fast/x11"],
+    } },
+    "gpui-pre-sum-tree": { forwards: "sum_tree", features: { "test-support": ["gpui_fast/test-support"] } },
+    "gpui-pre-reqwest-client": { forwards: "reqwest_client", features: {} },
+    "gpui-pre-util": { forwards: "gpui_util", features: {} },
+  };
+  for (const [name, spec] of Object.entries(compat)) {
+    const target = resolve(dest, name);
+    mkdirSync(target, { recursive: true });
+    const fastPackage = fastName(spec.forwards);
+    const featureTable: Record<string, string[]> = { default: ["gpui_fast/default"], ...spec.features };
+    writeFileSync(resolve(target, "Cargo.toml"), "# Modified by Longbridge for gpui-fast publication.\n" + Bun.TOML.stringify({
+      package: {
+        name, version: "0.3.8", license: "Apache-2.0", edition: workspace.package.edition,
+        description: `${fastPackage} under the gpui-pre name GPUI Kit pins; forwards to it.`,
+        repository: config.repository,
+      },
+      lib: { name: spec.forwards, path: "lib.rs", doctest: false },
+      features: featureTable,
+      dependencies: { gpui_fast: { package: fastPackage, path: "../" + spec.forwards, "default-features": false } },
+    } satisfies Record<string, unknown> as unknown as Manifest));
+    writeFileSync(resolve(target, "lib.rs"),
+      `//! ${fastPackage}, standing in for ${name}; see compat/README.md in the source repository.\n\npub use gpui_fast::*;\n`);
+  }
+
   const upstream = readToml(resolve(ROOT, "UPSTREAM"));
   const changed = run([
     "git", "diff", "--name-only", upstream.import_commit, "--", ...config.crates.map(name => "crates/" + name),
