@@ -1,0 +1,76 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "ztracing"
+version = "0.1.8"
+edition = "2024"
+publish = ["crates-io"]
+license = "Apache-2.0"
+repository = "https://github.com/feigeCode/gpui-fast"
+homepage = "https://github.com/feigeCode/gpui-fast"
+readme = "README.md"
+documentation = "https://docs.rs/ztracing/0.1.8/ztracing/"
+description = "ztracing: GPUI with gpui-fast rendering and layout optimizations"
+autoexamples = false
+autobenches = false
+autotests = false
+authors = ["Longbridge"]
+include = ["/src/**", "/resources/**", "/build.rs", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"]
+
+[lib]
+doctest = false
+name = "ztracing"
+
+[features]
+tracing-tracy = ["dep:tracing-tracy", "dep:tracing-subscriber", "dep:zlog"]
+tracy = ["tracing-tracy", "tracy-client"]
+web = ["dep:async-channel", "dep:js-sys", "dep:tracing-subscriber", "dep:wasm-bindgen", "dep:web-sys", "dep:zlog"]
+
+[dependencies.zlog]
+optional = true
+package = "zlog"
+version = "^0.1.8"
+path = "../zlog"
+
+[dependencies.tracing]
+version = "0.1.40"
+
+[dependencies.tracing-subscriber]
+version = "0.3"
+optional = true
+
+[dependencies.ztracing_macro]
+package = "ztracing-macro"
+version = "^0.1.8"
+path = "../ztracing_macro"
+
+[target."cfg(not(target_family = \"wasm\"))".dependencies.tracing-tracy]
+version = "0.11"
+optional = true
+features = ["ondemand"]
+
+[target."cfg(not(target_family = \"wasm\"))".dependencies.tracy-client]
+version = "0.18"
+optional = true
+features = ["ondemand"]
+
+[target."cfg(target_family = \"wasm\")".dependencies.async-channel]
+version = "2.5"
+default-features = false
+optional = true
+features = ["std"]
+
+[target."cfg(target_family = \"wasm\")".dependencies.js-sys]
+version = "0.3"
+optional = true
+
+[target."cfg(target_family = \"wasm\")".dependencies.wasm-bindgen]
+version = "0.2.120"
+optional = true
+
+[target."cfg(target_family = \"wasm\")".dependencies.web-sys]
+version = "0.3"
+optional = true
+features = ["console", "Performance"]
+
+[lints.rust.unexpected_cfgs]
+level = "allow"

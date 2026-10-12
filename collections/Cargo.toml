@@ -1,0 +1,40 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "collections"
+version = "0.1.8"
+edition = "2024"
+publish = ["crates-io"]
+license = "Apache-2.0"
+description = "collections: GPUI with gpui-fast rendering and layout optimizations"
+repository = "https://github.com/feigeCode/gpui-fast"
+homepage = "https://github.com/feigeCode/gpui-fast"
+readme = "README.md"
+documentation = "https://docs.rs/collections/0.1.8/collections/"
+autoexamples = false
+autobenches = false
+autotests = false
+authors = ["Longbridge"]
+include = ["/src/**", "/resources/**", "/build.rs", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"]
+
+[lib]
+path = "src/collections.rs"
+doctest = false
+name = "collections"
+
+[features]
+test-support = []
+
+[dependencies.indexmap]
+version = "2.7.0"
+features = ["serde"]
+
+[dependencies.rustc-hash]
+version = "2.1.0"
+
+[dependencies.gpui_util]
+package = "gpui-fast-util"
+version = "^0.1.8"
+path = "../gpui_util"
+
+[lints.rust.unexpected_cfgs]
+level = "allow"

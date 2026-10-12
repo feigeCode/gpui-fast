@@ -1,0 +1,43 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "http-client-tls"
+version = "0.1.8"
+edition = "2024"
+publish = ["crates-io"]
+license = "Apache-2.0"
+repository = "https://github.com/feigeCode/gpui-fast"
+homepage = "https://github.com/feigeCode/gpui-fast"
+readme = "README.md"
+documentation = "https://docs.rs/http-client-tls/0.1.8/http_client_tls/"
+description = "http_client_tls: GPUI with gpui-fast rendering and layout optimizations"
+autoexamples = false
+autobenches = false
+autotests = false
+authors = ["Longbridge"]
+include = ["/src/**", "/resources/**", "/build.rs", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"]
+
+[features]
+test-support = []
+
+[lib]
+path = "src/http_client_tls.rs"
+doctest = false
+test = false
+name = "http_client_tls"
+
+[dependencies.log]
+version = "0.4"
+default-features = false
+features = ["std", "serde"]
+
+[dependencies.rustls]
+version = "0.23.26"
+
+[dependencies.rustls-platform-verifier]
+version = "0.7"
+
+[dependencies.webpki-roots]
+version = "1.0.8"
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
