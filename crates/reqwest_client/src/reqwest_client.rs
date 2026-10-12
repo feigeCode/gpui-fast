@@ -57,10 +57,30 @@ impl ReqwestClient {
     }
 
     pub fn user_agent(agent: &str) -> anyhow::Result<Self> {
+        let user_agent = HeaderValue::from_str(agent)?;
         let mut map = HeaderMap::new();
-        map.insert(http::header::USER_AGENT, HeaderValue::from_str(agent)?);
+        map.insert(http::header::USER_AGENT, user_agent.clone());
         let client = Self::builder(None).default_headers(map).build()?;
-        Ok(client.into())
+        let mut client: ReqwestClient = client.into();
+        client.user_agent = Some(user_agent);
+        Ok(client)
+    }
+
+    /// The explicit "no proxy at all" variant of [`ReqwestClient::user_agent`].
+    /// Building this client never touches the OS proxy configuration, which
+    /// keeps reqwest's macOS `system-configuration` probe (a known NULL-object
+    /// panic source in test processes) out of the path.
+    pub fn user_agent_direct(agent: &str) -> anyhow::Result<Self> {
+        let user_agent = HeaderValue::from_str(agent)?;
+        let mut map = HeaderMap::new();
+        map.insert(http::header::USER_AGENT, user_agent.clone());
+        let client = Self::builder(None)
+            .no_proxy()
+            .default_headers(map)
+            .build()?;
+        let mut client: ReqwestClient = client.into();
+        client.user_agent = Some(user_agent);
+        Ok(client)
     }
 
     pub fn proxy_and_user_agent(proxy: Option<Url>, user_agent: &str) -> anyhow::Result<Self> {
