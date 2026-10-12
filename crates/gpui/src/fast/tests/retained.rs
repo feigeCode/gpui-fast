@@ -3,10 +3,11 @@
 
 use crate::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, StyleRefinement, Styled as _, TestAppContext, Window, WindowHandle, div,
+    Render, StatefulInteractiveElement as _, StyleRefinement, Styled as _, TestAppContext,
+    Window, WindowHandle, div,
     prelude::FluentBuilder as _, px,
 };
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, ops::Deref as _, rc::Rc};
 
 struct Row {
     label: u32,
@@ -2352,4 +2353,122 @@ fn new_layout_nodes_in_a_spliced_gap_survive_idle_frames() {
     }
     assert_eq!(outer_builds.get(), 1);
     assert_eq!(builds.get(), 3);
+}
+
+/// A view that gains a child with a debug selector must have that selector
+/// recorded on the frame after the child appears, even when the parent's
+/// structure is otherwise unchanged (a conditional grandchild appended to a
+/// list). Regression: navop's running-activity tests.
+#[test]
+fn a_gained_grandchild_debug_selector_is_recorded() {
+    struct Panel {
+        show: bool,
+    }
+    impl Render for Panel {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut items = vec![div().size(px(100.)).child("static").into_any_element()];
+            if self.show {
+                items.push(
+                    div()
+                        .id("strip")
+                        .debug_selector(|| "activity-strip".into())
+                        .size(px(50.))
+                        .into_any_element(),
+                );
+            }
+            let scroll = crate::ScrollHandle::new();
+            div()
+                .id("panel")
+                .size(px(300.))
+                .child(
+                    div()
+                        .id("scroll")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&scroll)
+                        .child(div().flex().flex_col().children(items)),
+                )
+        }
+    }
+
+    let mut cx = TestAppContext::single();
+    let (panel, mut vcx) = cx.add_window_view(|_, _| Panel { show: false });
+    let mut update = |panel: &crate::Entity<Panel>, cx: &mut TestAppContext| {
+        panel.update(cx, |p, cx| {
+            p.show = true;
+            cx.notify();
+        });
+    };
+    let cx = vcx.deref();
+    let mut app = cx.clone();
+    update(&panel, &mut app);
+    let bounds = vcx.update(|window, _| {
+        window
+            .rendered_frame
+            .debug_bounds
+            .get("activity-strip")
+            .copied()
+    });
+    assert!(
+        bounds.is_some(),
+        "gained grandchild selector must be recorded after the effect cycle"
+    );
+}
+
+/// A mouse handler that focuses its cell and then defers a focus takeover
+/// (the gpui-kit ContextMenu open_menu pattern) must end up with the deferred
+/// target focused after the same `simulate_mouse_down` flush. Regression probe
+/// for the right-click popup focus takeover.
+#[test]
+fn a_deferred_focus_takeover_wins_the_flush() {
+    use crate::FocusHandle;
+
+    struct Host {
+        cell: FocusHandle,
+        stolen: Option<FocusHandle>,
+        next_stolen: Option<FocusHandle>,
+    }
+    impl Render for Host {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("host")
+                .size(px(300.))
+                .track_focus(&self.cell)
+                .on_mouse_down(crate::MouseButton::Right, cx.listener(|this, _, window, cx| {
+                    // Exactly the navop table-cell right-click shape: focus
+                    // the cell synchronously, then defer the menu takeover.
+                    this.cell.focus(window, cx);
+                    let stolen = this.next_stolen.take().unwrap();
+                    this.stolen = Some(stolen.clone());
+                    window.defer(cx, move |window, cx| {
+                        stolen.focus(window, cx);
+                    });
+                }))
+        }
+    }
+
+    let mut cx = TestAppContext::single();
+    let (host, mut vcx) = cx.add_window_view(|_, cx| Host {
+        cell: cx.focus_handle(),
+        stolen: None,
+        next_stolen: Some(cx.focus_handle()),
+    });
+    let (cell, stolen) = vcx.update(|_, cx| {
+        let host = host.read(cx);
+        (host.cell.clone(), host.stolen.clone())
+    });
+    vcx.simulate_mouse_down(crate::point(px(10.), px(10.)), crate::MouseButton::Right, crate::Modifiers::default());
+    let (stolen, cell_focused, stolen_focused) = vcx.update(|window, cx| {
+        let host = host.read(cx);
+        let stolen = host.stolen.clone().unwrap();
+        (
+            stolen.clone(),
+            cell.is_focused(window),
+            stolen.is_focused(window),
+        )
+    });
+    assert!(
+        stolen_focused && !cell_focused,
+        "deferred focus takeover must win, got cell={cell_focused} stolen={stolen_focused}"
+    );
 }
