@@ -182,6 +182,22 @@ export function prepare(config: ReleaseConfig, version: string, dest = DEST): vo
     // attribute); snapshots drop tests, so drop the dependency too. Its
     // `perf` dependency lives in tooling/, not crates/, and stays out.
     if (name === "gpui") delete manifest.dependencies["util_macros"];
+    // gpui_ios is not shipped in this release workspace (no gpui-pre-ios
+    // shim exists). Its cfg(ios) dependency would otherwise resolve to the
+    // crates.io gpui-pre snapshot, whose internal `=snapshot` pins conflict
+    // with the 0.3.126 shims patched over crates-io. Desktop-only release:
+    // drop the ios target section and the gpui_ios references in features.
+    if (name === "gpui_platform") {
+      const iosKey = 'cfg(target_os = "ios")';
+      if (manifest.target?.[iosKey]) {
+        delete manifest.target[iosKey];
+        if (!Object.keys(manifest.target).length) delete manifest.target;
+      }
+      for (const [feature, deps] of Object.entries(manifest.features ?? {})) {
+        const kept = (deps as string[]).filter(dep => !dep.startsWith("gpui_ios/"));
+        if (kept.length !== (deps as string[]).length) manifest.features[feature] = kept;
+      }
+    }
     writeFileSync(resolve(target, "Cargo.toml"),
       "# Modified by Longbridge for gpui-fast publication.\n" + Bun.TOML.stringify(manifest));
     cpSync(resolve(ROOT, "LICENSE"), resolve(target, "LICENSE"));
