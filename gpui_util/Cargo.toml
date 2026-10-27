@@ -1,0 +1,35 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "gpui-fast-util"
+version = "0.1.12"
+publish = ["crates-io"]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/feigeCode/gpui-fast"
+homepage = "https://github.com/feigeCode/gpui-fast"
+readme = "README.md"
+documentation = "https://docs.rs/gpui-fast-util/0.1.12/gpui_util/"
+description = "gpui_util: GPUI with gpui-fast rendering and layout optimizations"
+autoexamples = false
+autobenches = false
+autotests = false
+authors = ["Longbridge"]
+include = ["/src/**", "/resources/**", "/build.rs", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"]
+
+[lib]
+doctest = false
+name = "gpui_util"
+
+[dependencies.log]
+version = "0.4"
+default-features = false
+features = ["std", "serde"]
+
+[dependencies.anyhow]
+version = "1.0.86"
+
+[target."cfg(target_os = \"windows\")".dependencies.which]
+version = "8"
+
+[lints.rust.unexpected_cfgs]
+level = "allow"

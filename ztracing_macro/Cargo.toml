@@ -1,0 +1,26 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "ztracing-macro"
+version = "0.1.12"
+edition = "2024"
+publish = ["crates-io"]
+license = "Apache-2.0"
+repository = "https://github.com/feigeCode/gpui-fast"
+homepage = "https://github.com/feigeCode/gpui-fast"
+readme = "README.md"
+documentation = "https://docs.rs/ztracing-macro/0.1.12/ztracing_macro/"
+description = "ztracing_macro: GPUI with gpui-fast rendering and layout optimizations"
+autoexamples = false
+autobenches = false
+autotests = false
+authors = ["Longbridge"]
+include = ["/src/**", "/resources/**", "/build.rs", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"]
+
+[lib]
+proc-macro = true
+test = false
+doctest = false
+name = "ztracing_macro"
+
+[lints.rust.unexpected_cfgs]
+level = "allow"

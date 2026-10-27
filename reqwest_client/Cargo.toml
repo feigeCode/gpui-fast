@@ -1,0 +1,72 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "reqwest-client"
+version = "0.1.12"
+edition = "2024"
+publish = ["crates-io"]
+license = "Apache-2.0"
+repository = "https://github.com/feigeCode/gpui-fast"
+homepage = "https://github.com/feigeCode/gpui-fast"
+readme = "README.md"
+documentation = "https://docs.rs/reqwest-client/0.1.12/reqwest_client/"
+description = "reqwest_client: GPUI with gpui-fast rendering and layout optimizations"
+autoexamples = false
+autobenches = false
+autotests = false
+authors = ["Longbridge"]
+include = ["/src/**", "/resources/**", "/build.rs", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"]
+
+[features]
+test-support = []
+
+[lib]
+path = "src/reqwest_client.rs"
+doctest = false
+name = "reqwest_client"
+
+[dependencies.anyhow]
+version = "1.0.86"
+
+[dependencies.bytes]
+version = "1.0"
+
+[dependencies.futures]
+version = "0.3.34"
+
+[dependencies.http_client]
+package = "http-client"
+version = "^0.1.12"
+path = "../http_client"
+
+[dependencies.log]
+version = "0.4"
+default-features = false
+features = ["std"]
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread"]
+
+[dependencies.regex]
+version = "1.5"
+default-features = false
+features = ["std", "perf"]
+
+[dependencies.reqwest]
+default-features = false
+features = ["http2", "macos-system-configuration", "rustls-tls-native-roots", "socks", "stream"]
+package = "zed-reqwest"
+version = "0.12.15-zed"
+
+[dependencies.gpui_util]
+package = "gpui-fast-util"
+version = "^0.1.12"
+path = "../gpui_util"
+
+[target."cfg(not(target_family = \"wasm\"))".dependencies.http_client_tls]
+package = "http-client-tls"
+version = "^0.1.12"
+path = "../http_client_tls"
+
+[lints.rust.unexpected_cfgs]
+level = "allow"

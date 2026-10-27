@@ -1,0 +1,38 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "derive-refineable"
+version = "0.1.12"
+edition = "2024"
+publish = ["crates-io"]
+license = "Apache-2.0"
+description = "derive_refineable: GPUI with gpui-fast rendering and layout optimizations"
+repository = "https://github.com/feigeCode/gpui-fast"
+homepage = "https://github.com/feigeCode/gpui-fast"
+readme = "README.md"
+documentation = "https://docs.rs/derive-refineable/0.1.12/derive_refineable/"
+autoexamples = false
+autobenches = false
+autotests = false
+authors = ["Longbridge"]
+include = ["/src/**", "/resources/**", "/build.rs", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"]
+
+[lib]
+path = "src/derive_refineable.rs"
+proc-macro = true
+doctest = false
+test = false
+name = "derive_refineable"
+
+[dependencies.proc-macro2]
+version = "1.0.93"
+
+[dependencies.quote]
+version = "1.0.9"
+
+[dependencies.syn]
+version = "2.0"
+default-features = true
+features = ["proc-macro"]
+
+[lints.rust.unexpected_cfgs]
+level = "allow"

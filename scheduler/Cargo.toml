@@ -1,0 +1,64 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "scheduler"
+version = "0.1.12"
+edition = "2024"
+publish = ["crates-io"]
+license = "Apache-2.0"
+repository = "https://github.com/feigeCode/gpui-fast"
+homepage = "https://github.com/feigeCode/gpui-fast"
+readme = "README.md"
+documentation = "https://docs.rs/scheduler/0.1.12/scheduler/"
+description = "scheduler: GPUI with gpui-fast rendering and layout optimizations"
+autoexamples = false
+autobenches = false
+autotests = false
+authors = ["Longbridge"]
+include = ["/src/**", "/resources/**", "/build.rs", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"]
+
+[lib]
+path = "src/scheduler.rs"
+doctest = false
+name = "scheduler"
+
+[features]
+test-support = []
+wasm-threads = ["dep:wasm_thread", "flume/spin"]
+
+[dependencies.async-task]
+version = "4.7"
+
+[dependencies.backtrace]
+version = "0.3"
+
+[dependencies.chrono]
+version = "0.4"
+default-features = false
+features = ["std", "serde", "now", "wasmbind"]
+
+[dependencies.flume]
+version = "0.12"
+default-features = false
+features = ["async"]
+
+[dependencies.futures]
+version = "0.3.34"
+
+[dependencies.parking_lot]
+version = "0.12.1"
+
+[dependencies.rand]
+version = "0.9"
+default-features = false
+features = ["std", "std_rng", "os_rng"]
+
+[dependencies.web-time]
+version = "1.1.0"
+
+[target."cfg(target_family = \"wasm\")".dependencies.wasm_thread]
+version = "0.3"
+features = ["es_modules"]
+optional = true
+
+[lints.rust.unexpected_cfgs]
+level = "allow"

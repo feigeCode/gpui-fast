@@ -1,0 +1,21 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "gpui-pre-util"
+version = "0.3.126"
+license = "Apache-2.0"
+edition = "2024"
+description = "gpui-fast-util under the gpui-pre name GPUI Kit pins; forwards to it."
+repository = "https://github.com/feigeCode/gpui-fast"
+
+[lib]
+name = "gpui_util"
+path = "lib.rs"
+doctest = false
+
+[features]
+default = []
+
+[dependencies.gpui_fast]
+package = "gpui-fast-util"
+path = "../gpui_util"
+default-features = false

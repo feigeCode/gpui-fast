@@ -1,0 +1,46 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "zlog"
+version = "0.1.12"
+edition = "2024"
+publish = ["crates-io"]
+license = "Apache-2.0"
+repository = "https://github.com/feigeCode/gpui-fast"
+homepage = "https://github.com/feigeCode/gpui-fast"
+readme = "README.md"
+documentation = "https://docs.rs/zlog/0.1.12/zlog/"
+description = "zlog: GPUI with gpui-fast rendering and layout optimizations"
+autoexamples = false
+autobenches = false
+autotests = false
+authors = ["Longbridge"]
+include = ["/src/**", "/resources/**", "/build.rs", "/Cargo.toml", "/README.md", "/LICENSE", "/NOTICE"]
+
+[lib]
+path = "src/zlog.rs"
+doctest = false
+name = "zlog"
+
+[features]
+default = []
+
+[dependencies.collections]
+version = "^0.1.12"
+package = "collections"
+path = "../collections"
+
+[dependencies.chrono]
+version = "0.4"
+default-features = true
+features = ["std", "serde"]
+
+[dependencies.log]
+version = "0.4"
+default-features = false
+features = ["std", "kv_unstable_std"]
+
+[dependencies.anyhow]
+version = "1.0.86"
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
