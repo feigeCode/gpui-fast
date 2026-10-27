@@ -109,8 +109,8 @@ use std::{cell::Cell, rc::Rc};
 
 use gpui::{
     AnyElement, AnyView, App, Context, DispatchPhase, Entity, ListAlignment, ListState, Modifiers,
-    PlatformInput, Render, ScrollDelta, ScrollWheelEvent, SharedString, StyleRefinement,
-    TouchPhase, WeakEntity, Window, canvas, div, point, prelude::*, px,
+    PlatformInput, Render, ScrollDelta, ScrollEvent, SharedString, StyleRefinement, TouchPhase,
+    WeakEntity, Window, canvas, div, point, prelude::*, px,
 };
 
 use super::chat::{
@@ -482,7 +482,7 @@ impl ChatView {
             |bounds, _, _| bounds,
             move |_, bounds, window, _| {
                 let before = Cell::new(px(0.));
-                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
+                window.on_mouse_event(move |event: &ScrollEvent, phase, _, cx| {
                     let ScrollDelta::Pixels(delta) = event.delta else {
                         return;
                     };
@@ -817,11 +817,12 @@ impl Sweep {
 fn scroll_events(up: bool, starts: bool, trackpad: bool) -> Vec<PlatformInput> {
     let sign = if up { 1. } else { -1. };
     let event = |delta: f32, touch_phase| {
-        PlatformInput::ScrollWheel(ScrollWheelEvent {
+        PlatformInput::Scroll(ScrollEvent {
             position: point(px(720.), px(400.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(sign * delta))),
             modifiers: Modifiers::default(),
             touch_phase,
+            ..Default::default()
         })
     };
     if !trackpad {

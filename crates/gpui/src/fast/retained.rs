@@ -21,7 +21,8 @@ use crate::fast::splice::{Prebuilt, Rebuild, Splice, SplicedPrepaint};
 use crate::window::{PaintIndex, PrepaintStateIndex};
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, ElementId, EntityId, GlobalElementId,
-    HitboxId, IntoElement, LayoutId, Pixels, Size, Style, TextStyle, View, ViewElement, Window,
+    HitboxId, LayoutId, Pixels, PlatformInputHandler, Size, Style, TextStyle, View, ViewElement,
+    Window,
 };
 use collections::{FxHashMap, FxHashSet};
 use refineable::Refineable;
@@ -33,7 +34,6 @@ use std::{any::TypeId, cell::RefCell, mem, ops::Range, rc::Rc};
 #[inline(always)]
 pub(crate) fn begin_frame(window: &mut Window, cx: &App) {
     window.fast_layout.phase_times.begin();
-    crate::fast::layers::hover_freeze::begin_draw(window);
     crate::fast::a11y::new_frame(window);
     window.mark_changed_retained_views_dirty(cx);
 }
@@ -46,6 +46,23 @@ pub(crate) fn begin_frame(window: &mut Window, cx: &App) {
 #[inline(always)]
 pub(crate) fn draw_outside_frames(window: &mut Window) {
     window.refreshing = true;
+}
+
+/// Forwarded to by `Window::draw` as it hands the platform this frame's input
+/// handler.
+pub(crate) fn note_installed_input_handler(window: &mut Window, handler: &PlatformInputHandler) {
+    window.retained_state.installed_input_focus = Some(handler.focus_id());
+}
+
+/// Forwarded to by `Window::draw` as it takes back the input handler it gave
+/// the platform. A view drawn again from last frame hands the platform that
+/// handler again, which is only right if it is the one GPUI gave it: when
+/// the platform hands back another, nothing is drawn again from last frame,
+/// so the views that paint input handlers paint them anew.
+pub(crate) fn note_restored_input_handler(window: &mut Window, handler: &PlatformInputHandler) {
+    if window.retained_state.installed_input_focus != Some(handler.focus_id()) {
+        window.refreshing = true;
+    }
 }
 
 /// The retained subtrees being prepainted right now, for something deferred
@@ -131,6 +148,7 @@ pub(crate) enum PaintStatus {
 /// place it was drawn in and what it inherited there.
 #[derive(PartialEq)]
 pub(crate) struct RetainedContext {
+    pub(crate) composition_surface: Option<crate::fast::composition::CompositionSurfaceId>,
     pub(crate) bounds: Bounds<Pixels>,
     pub(crate) content_mask: ContentMask<Pixels>,
     pub(crate) text_style: TextStyle,
@@ -254,6 +272,9 @@ pub(crate) struct RetainedState {
     /// handed the elements it built, rather than what they wrote as they
     /// were laid out. See [`note_rendered`].
     pub(crate) render_writes: FxHashMap<EntityId, Range<u64>>,
+    /// The focus of the input handler last given to the platform window, if
+    /// one was. See [`note_restored_input_handler`].
+    pub(crate) installed_input_focus: Option<Option<crate::FocusId>>,
 }
 
 impl RetainedState {
@@ -272,6 +293,7 @@ impl RetainedState {
             splice_keys: FxHashSet::default(),
             rendering_since: FxHashMap::default(),
             render_writes: FxHashMap::default(),
+            installed_input_focus: None,
         }
     }
 
@@ -417,7 +439,7 @@ impl RetainedSubtrees {
     }
 
     /// Whether any subtree was drawn from last frame.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn reused_any(&self) -> bool {
         self.reused_any
     }
@@ -611,6 +633,7 @@ impl Window {
             && context.opacity == self.element_opacity
             && context.content_mask == self.content_mask()
             && context.text_style == self.text_style()
+            && context.composition_surface == crate::fast::composition::input_surface(self)
     }
 
     /// Lays out the view last frame's record `previous` stands for as it was
@@ -880,6 +903,7 @@ impl Window {
                 paint: PaintStatus::Unpainted,
                 nested: 0,
                 context: Rc::new(RetainedContext {
+                    composition_surface: None,
                     bounds: Bounds::default(),
                     content_mask: ContentMask::default(),
                     text_style: TextStyle::default(),
@@ -949,6 +973,7 @@ impl Window {
             };
         }
         let context = RetainedContext {
+            composition_surface: crate::fast::composition::input_surface(self),
             bounds,
             content_mask: self.content_mask(),
             text_style: self.text_style(),
@@ -1356,18 +1381,6 @@ pub(crate) fn finish_retained_frame(window: &mut Window) {
     window.next_frame.retained.finish_frame();
     crate::fast::layers::paint::finish_frame(window);
     crate::fast::layers::finish_frame(window);
-    #[cfg(any(test, feature = "test-support"))]
-    if window.next_frame.retained.reused_any() {
-        // Reused subtrees do not paint, and the bounds they would have
-        // recorded for tests to find them by are last frame's.
-        for (selector, bounds) in &window.rendered_frame.debug_bounds {
-            window
-                .next_frame
-                .debug_bounds
-                .entry(selector.clone())
-                .or_insert(*bounds);
-        }
-    }
 }
 
 // These reach into the window's layout state, for views drawn again at the
@@ -1502,12 +1515,8 @@ impl<V: View> ViewElement<V> {
                         }
                         let start = note_rendering(window, cx, entity_id);
                         let mut recording = window.begin_retained_layout(cx);
-                        let mut element = self
-                            .view
-                            .take()
-                            .unwrap()
-                            .render(window, cx)
-                            .into_any_element();
+                        let mut element =
+                            crate::view::render_view(self.view.take().unwrap(), window, cx);
                         note_rendered(window, cx, entity_id, start);
                         recording.rendered(cx);
                         let layout_id = element.request_layout(window, cx);
@@ -1521,12 +1530,8 @@ impl<V: View> ViewElement<V> {
                         )
                     }
                     _ => {
-                        let mut element = self
-                            .view
-                            .take()
-                            .unwrap()
-                            .render(window, cx)
-                            .into_any_element();
+                        let mut element =
+                            crate::view::render_view(self.view.take().unwrap(), window, cx);
                         let layout_id = element.request_layout(window, cx);
                         (
                             layout_id,
@@ -1543,12 +1548,8 @@ impl<V: View> ViewElement<V> {
             window.with_id(
                 ElementId::Name(std::any::type_name::<V>().into()),
                 |window| {
-                    let mut element = self
-                        .view
-                        .take()
-                        .unwrap()
-                        .render(window, cx)
-                        .into_any_element();
+                    let mut element =
+                        crate::view::render_view(self.view.take().unwrap(), window, cx);
                     let layout_id = element.request_layout(window, cx);
                     (
                         layout_id,
@@ -1685,12 +1686,8 @@ impl<V: View> ViewElement<V> {
                     }
                     let start = note_rendering(window, cx, entity_id);
                     let recording = window.begin_retained(global_id, cx);
-                    let mut element = self
-                        .view
-                        .take()
-                        .unwrap()
-                        .render(window, cx)
-                        .into_any_element();
+                    let mut element =
+                        crate::view::render_view(self.view.take().unwrap(), window, cx);
                     note_rendered(window, cx, entity_id, start);
                     let render = recording.rendered(cx);
                     element.layout_as_root(bounds.size.into(), window, cx);
@@ -1766,7 +1763,7 @@ impl<V: View> ViewElement<V> {
         let start = entity_id.map(|entity_id| note_rendering(window, cx, entity_id));
         let view = self.view.take().unwrap();
         let (mut element, layout_id) = window.with_layout_key_of_prepainting_element(|window| {
-            let mut element = view.render(window, cx).into_any_element();
+            let mut element = crate::view::render_view(view, window, cx);
             if let (Some(entity_id), Some(start)) = (entity_id, start) {
                 note_rendered(window, cx, entity_id, start);
             }
@@ -1859,7 +1856,7 @@ pub(crate) fn request_view_layout<V: View>(
 #[cfg(feature = "profiler")]
 fn end_view_profile<V: View>(
     view: &ViewElement<V>,
-    start: Option<std::time::Instant>,
+    start: Option<scheduler::Instant>,
     phase: crate::profiler::ViewPhase,
     window: &mut Window,
 ) {
@@ -1965,7 +1962,12 @@ impl HitboxId {
     /// Whether the hitbox is hovered, as [`HitboxId::is_hovered`] answers,
     /// without noting that it was asked.
     pub(crate) fn hovered_now(self, window: &Window) -> bool {
-        window.captured_hitbox == Some(self)
-            || (!window.last_input_was_keyboard() && self.hit_test(window))
+        if window.captured_hitbox == Some(self) {
+            return true;
+        }
+        if crate::fast::layers::hover_freeze::hides_hover(window) {
+            return false;
+        }
+        self.hit_test(window)
     }
 }

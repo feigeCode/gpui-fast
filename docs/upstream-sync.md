@@ -135,17 +135,13 @@ unchanged, and a new entry needs as good a reason.
   list), `LAYER_TILE_TEXTURE_BASE`, `layer_tile_texture_id`, `layer_tile_id` and
   `decode_layer_tile`, because renderers live in other crates and read scroll
   layers from the scene. Polychrome sprites whose texture index is at or
-  above `LAYER_TILE_TEXTURE_BASE` are scroll layer tiles, not atlas textures.
+  above `LAYER_TILE_TEXTURE_BASE` are renderer layer references, not atlas
+  textures. Reserved ids from `0xF100_0000` identify rounded overflow groups
+  with `tile_size = 0`; their drawable scene carries padding-edge geometry
+  in a non-composited frame keyed by `u32::MAX`. The private wire format lives
+  in `fast::rounded_clip_scene`; Metal, WGPU and Direct3D evaluate the clip
+  stack directly without intermediate render targets.
 - `crates/gpui/Cargo.toml` names this repository and sets `publish = false`.
-- The workspace pins Taffy 0.14 where upstream pins 0.13. Taffy 0.13 keeps
-  one cached size per kind of constraint, so a node measured under two widths
-  in one layout evicts one with the other, and the clean subtrees around a
-  single dirty node are laid out again on every frame; 0.14 keeps nine sizes
-  per node whatever their kind. 0.14 hands a leaf's measure function its whole
-  layout, so `taffy.rs` lays the tree out through
-  `fast::layout::MeasuredTaffy`, which lays each leaf out around GPUI's
-  measurement as 0.13 did. When upstream moves to 0.14 or later, the sync
-  takes its version and drops `MeasuredTaffy`.
 - Window composition, the API of
   [zed#62379](https://github.com/zed-industries/zed/pull/62379), which
   upstream has not merged yet: native views drawn between a window's GPUI
@@ -177,6 +173,17 @@ for `gpui_macos`, `WgpuRenderer` gains `new_sharing_atlas` and
   pinned windows above all others). The `native_webview` example in
   `gpui_perf` shows composition on macOS, Windows and Linux, and
   `linux_webview` shows a WebKitGTK page under overlays on X11.
+
+Composition input extends that existing exception: `ComposedScene::layer_hitboxes`
+lets the separate platform crates use prepared GPUI hitboxes instead of inferring
+input from graphics. `WindowComposition::on_input` registers a cooperating
+windowless producer; the defaulted `PlatformSurfaceAttachment::input_forwarding`
+reader carries that choice through the existing platform-order update. Existing
+attachment implementations and platform surface struct initializers stay valid. OS-managed child views keep
+their platform event loop. Capture runs first, press ownership survives through
+release, and leave is sent when the pointer changes recipients. Prepaint scopes
+and retained context keep input ownership with the same surface as its paint.
+No application-specific timeline policy belongs here.
 
 When the check fails, move the change into a `fast/` module and leave a hook
 behind that names it; use `git diff <import_commit> -- <file>` to see what

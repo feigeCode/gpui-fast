@@ -1,7 +1,8 @@
 //! `LayoutStats`: counters and timings describing the work a frame did, for benchmarks and profiling.
 
 use crate::{TaffyLayoutEngine, Window};
-use std::time::{Duration, Instant};
+use scheduler::Instant;
+use std::time::Duration;
 
 /// Counters describing the work the layout engine performed, for benchmarking
 /// and profiling.
@@ -169,6 +170,19 @@ impl MeasureTally {
         if let Some(started_at) = started_at {
             self.time += started_at.elapsed();
         }
+    }
+
+    /// Counts a measurement of `node` started by [`Self::start`], under the
+    /// constraints it was measured under, noting the leaf measured.
+    pub(crate) fn measured(
+        &mut self,
+        started_at: Option<Instant>,
+        node: taffy::NodeId,
+        known_dimensions: crate::Size<Option<crate::Pixels>>,
+        available_space: crate::Size<crate::AvailableSpace>,
+    ) {
+        self.finish(started_at);
+        self.leaves.note(node, known_dimensions, available_space);
     }
 }
 

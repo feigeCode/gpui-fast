@@ -8,14 +8,19 @@
 //! costs without layers.
 //!
 //! So for [`HOVER_FREEZE`] after a wheel event, while the pointer stays where
-//! the event was, nothing is hovered: the frame's hit test, and the one a
-//! list foretells for its rows, are empty. When the wheel stops the window is
-//! drawn again, and hover follows the pointer as before. A pointer that moves
-//! ends the freeze at once.
+//! the event was, hover styling is held still: while a frame is drawn,
+//! [`crate::HitboxId::is_hovered`] is false, and the hit test a list foretells
+//! for its rows is empty. Only drawing is held. The frame's hit test stays the
+//! geometry under the pointer, so the cursor follows it, and events dispatched
+//! between frames read it: a click at the spot the wheel scrolled under
+//! reaches its handler. When the wheel stops the window is drawn again, and
+//! hover follows the pointer as before. A pointer that moves ends the freeze
+//! at once.
 
-use std::time::{Duration, Instant};
+use scheduler::Instant;
+use std::time::Duration;
 
-use crate::{App, HitTest, Pixels, Point, Window};
+use crate::{App, Pixels, Point, Window};
 
 /// How long after the last wheel event hover stays held still.
 pub(crate) const HOVER_FREEZE: Duration = Duration::from_millis(100);
@@ -72,22 +77,16 @@ pub(crate) fn frozen(window: &Window) -> bool {
         })
 }
 
-/// Empties the last frame's hit test as a frame begins to be drawn while
-/// hover is held still, so that nothing rendered counts as hovered.
-pub(crate) fn begin_draw(window: &mut Window) {
-    if frozen(window) {
-        window.mouse_hit_test = HitTest::default();
-    }
-}
-
-/// The hit test of the frame being drawn, taken between its prepaint and its
-/// paint: empty while hover is held still.
-pub(crate) fn hit_test(window: &Window) -> HitTest {
-    if frozen(window) {
-        HitTest::default()
-    } else {
-        window.next_frame.hit_test(window.mouse_position)
-    }
+/// Whether hover reads as nothing for a hitbox the pointer has not captured,
+/// for [`crate::HitboxId::is_hovered`] and what a retained subtree records of
+/// it: after keyboard input, as upstream has it, and while a frame is drawn
+/// with hover held still.
+///
+/// Event dispatch is not drawing. A mouse listener asks `is_hovered` before it
+/// runs, so holding hover there too would drop a click made under a still
+/// pointer right after the wheel.
+pub(crate) fn hides_hover(window: &Window) -> bool {
+    window.last_input_was_keyboard() || (!window.invalidator.not_drawing() && frozen(window))
 }
 
 impl Window {

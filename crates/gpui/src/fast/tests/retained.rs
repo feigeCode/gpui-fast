@@ -3,9 +3,8 @@
 
 use crate::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, StatefulInteractiveElement as _, StyleRefinement, Styled as _, TestAppContext,
-    Window, WindowHandle, div,
-    prelude::FluentBuilder as _, px,
+    Render, StatefulInteractiveElement as _, StyleRefinement, Styled as _, TestAppContext, Window,
+    WindowHandle, div, prelude::FluentBuilder as _, px,
 };
 use std::{cell::Cell, ops::Deref as _, rc::Rc};
 
@@ -2377,17 +2376,14 @@ fn a_gained_grandchild_debug_selector_is_recorded() {
                 );
             }
             let scroll = crate::ScrollHandle::new();
-            div()
-                .id("panel")
-                .size(px(300.))
-                .child(
-                    div()
-                        .id("scroll")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&scroll)
-                        .child(div().flex().flex_col().children(items)),
-                )
+            div().id("panel").size(px(300.)).child(
+                div()
+                    .id("scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&scroll)
+                    .child(div().flex().flex_col().children(items)),
+            )
         }
     }
 
@@ -2434,16 +2430,19 @@ fn a_deferred_focus_takeover_wins_the_flush() {
                 .id("host")
                 .size(px(300.))
                 .track_focus(&self.cell)
-                .on_mouse_down(crate::MouseButton::Right, cx.listener(|this, _, window, cx| {
-                    // Exactly the navop table-cell right-click shape: focus
-                    // the cell synchronously, then defer the menu takeover.
-                    this.cell.focus(window, cx);
-                    let stolen = this.next_stolen.take().unwrap();
-                    this.stolen = Some(stolen.clone());
-                    window.defer(cx, move |window, cx| {
-                        stolen.focus(window, cx);
-                    });
-                }))
+                .on_mouse_down(
+                    crate::MouseButton::Right,
+                    cx.listener(|this, _, window, cx| {
+                        // Exactly the navop table-cell right-click shape: focus
+                        // the cell synchronously, then defer the menu takeover.
+                        this.cell.focus(window, cx);
+                        let stolen = this.next_stolen.take().unwrap();
+                        this.stolen = Some(stolen.clone());
+                        window.defer(cx, move |window, cx| {
+                            stolen.focus(window, cx);
+                        });
+                    }),
+                )
         }
     }
 
@@ -2457,7 +2456,11 @@ fn a_deferred_focus_takeover_wins_the_flush() {
         let host = host.read(cx);
         (host.cell.clone(), host.stolen.clone())
     });
-    vcx.simulate_mouse_down(crate::point(px(10.), px(10.)), crate::MouseButton::Right, crate::Modifiers::default());
+    vcx.simulate_mouse_down(
+        crate::point(px(10.), px(10.)),
+        crate::MouseButton::Right,
+        crate::Modifiers::default(),
+    );
     let (stolen, cell_focused, stolen_focused) = vcx.update(|window, cx| {
         let host = host.read(cx);
         let stolen = host.stolen.clone().unwrap();
@@ -2713,4 +2716,85 @@ fn a_view_written_inside_a_cached_view_is_rendered_again_with_it() {
     cx.update_window(window.into(), |_, window, _| window.forget_retained_state())
         .unwrap();
     assert_eq!(red, backgrounds(&mut cx, window.into()));
+}
+
+/// A view that draws a box tests find by its selector, counting its builds.
+struct Labelled {
+    builds: Rc<Cell<usize>>,
+}
+
+impl Render for Labelled {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.builds.set(self.builds.get() + 1);
+        div()
+            .debug_selector(|| "kept".into())
+            .size(px(40.))
+            .bg(crate::blue())
+    }
+}
+
+/// A root holding a [`Labelled`] view, and a box of its own while `shown`.
+struct Shelf {
+    kept: Entity<Labelled>,
+    shown: bool,
+}
+
+impl Render for Shelf {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size(px(300.))
+            .child(self.kept.clone())
+            .when(self.shown, |this| {
+                this.child(
+                    div()
+                        .debug_selector(|| "gone".into())
+                        .size(px(20.))
+                        .bg(crate::red()),
+                )
+            })
+    }
+}
+
+/// An element the frame no longer draws is gone from the frame's debug
+/// bounds, though a view beside it was drawn again from the last frame, and
+/// that view's elements are still found where they are drawn.
+#[test]
+fn an_element_no_longer_drawn_leaves_the_debug_bounds_of_a_retained_frame() {
+    let mut cx = TestAppContext::single();
+    let builds = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let builds = builds.clone();
+        move |_, cx| Shelf {
+            kept: cx.new(|_| Labelled { builds }),
+            shown: true,
+        }
+    });
+    let bounds = |cx: &mut TestAppContext, selector: &str| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.rendered_frame.debug_bounds.get(selector).copied()
+        })
+        .unwrap()
+    };
+    let kept = bounds(&mut cx, "kept").expect("the view's box is drawn");
+    assert!(bounds(&mut cx, "gone").is_some(), "the root's box is drawn");
+    let builds_before = builds.get();
+
+    window
+        .update(&mut cx, |shelf, _, cx| {
+            shelf.shown = false;
+            cx.notify();
+        })
+        .unwrap();
+    assert_eq!(
+        bounds(&mut cx, "gone"),
+        None,
+        "the root's box is no longer drawn"
+    );
+    assert_eq!(
+        builds.get(),
+        builds_before,
+        "the view beside it was drawn from the last frame"
+    );
+    assert_eq!(bounds(&mut cx, "kept"), Some(kept));
 }

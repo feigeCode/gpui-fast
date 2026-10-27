@@ -172,7 +172,8 @@ impl PlatformAtlas for WgpuAtlas {
             },
             size: bounds.size,
         };
-        lock.backend.upload_texture(tile.texture_id, upload_bounds, bytes);
+        lock.backend
+            .upload_texture(tile.texture_id, upload_bounds, bytes);
         Ok(())
     }
 
@@ -189,9 +190,9 @@ impl AtlasBackend for WgpuAtlasTextures {
         bytes: &[u8],
     ) -> Result<AtlasTile> {
         let tile = match kind {
-            AtlasTextureKind::DynamicTexture => {
-                self.allocate_dedicated(size, kind).context("failed to allocate")?
-            }
+            AtlasTextureKind::DynamicTexture => self
+                .allocate_dedicated(size, kind)
+                .context("failed to allocate")?,
             _ => self.allocate(size, kind).context("failed to allocate")?,
         };
         self.upload_texture(tile.texture_id, tile.bounds, bytes);
@@ -227,7 +228,6 @@ impl AtlasBackend for WgpuAtlasTextures {
     fn resource_generation(&self) -> u64 {
         self.resource_generation
     }
-
 }
 
 impl WgpuAtlasTextures {
@@ -671,6 +671,7 @@ mod tests {
                     power_preference: wgpu::PowerPreference::LowPower,
                     compatible_surface: None,
                     force_fallback_adapter: false,
+                    apply_limit_buckets: false,
                 })
                 .await
                 .map_err(|error| anyhow::anyhow!("failed to request adapter: {error}"))?;
@@ -684,6 +685,7 @@ mod tests {
                     memory_hints: wgpu::MemoryHints::MemoryUsage,
                     trace: wgpu::Trace::Off,
                     experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                    default_queue: wgpu::QueueDescriptor::default(),
                 })
                 .await
                 .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;

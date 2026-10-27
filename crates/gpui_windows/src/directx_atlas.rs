@@ -242,7 +242,6 @@ impl AtlasBackend for DirectXAtlasTextures {
 }
 
 impl DirectXAtlasTextures {
-
     fn allocate_dedicated(
         &mut self,
         size: Size<DevicePixels>,

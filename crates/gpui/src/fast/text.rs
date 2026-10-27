@@ -3,7 +3,7 @@
 
 use crate::fast::layout::Adopted;
 use crate::{
-    App, AvailableSpace, DecorationRun, FontRun, FrameCache, Hsla, LayoutId, LineLayout,
+    App, AvailableSpace, Bounds, DecorationRun, FontRun, FrameCache, Hsla, LayoutId, LineLayout,
     LineLayoutCache, LineLayoutIndex, Pixels, PlatformTextSystem, SharedString, Size,
     StrikethroughStyle, TextLayout, TextLayoutInner, TextOverflow, TextRun, TextStyle,
     TruncateFrom, UnderlineStyle, WhiteSpace, Window, WindowTextSystem, WrappedLine,
@@ -198,21 +198,7 @@ pub(crate) fn layout_text(
     window: &mut Window,
     cx: &mut App,
 ) -> LayoutId {
-    let text_style = crate::fast::text_style::text_style(window);
-    let font_size = text_style.font_size.to_pixels(window.rem_size());
-    let line_height = window.pixel_snap(
-        text_style
-            .line_height
-            .to_pixels(font_size.into(), window.rem_size()),
-    );
-    let inputs = TextMeasureInputs {
-        text,
-        runs: runs.unwrap_or_default(),
-        text_style,
-        font_size,
-        line_height,
-        layout: RefCell::new(layout.clone()),
-    };
+    let inputs = measure_inputs(layout, text, runs.unwrap_or_default(), window);
     window.request_carried_measured_layout(
         inputs,
         adopt_measurement,
@@ -220,6 +206,116 @@ pub(crate) fn layout_text(
         measure_text,
         cx,
     )
+}
+
+/// The inputs of text laid out in the text style in effect, keeping its
+/// measurement in `layout`.
+fn measure_inputs(
+    layout: &TextLayout,
+    text: SharedString,
+    runs: Vec<TextRun>,
+    window: &Window,
+) -> TextMeasureInputs {
+    let text_style = crate::fast::text_style::text_style(window);
+    let font_size = text_style.font_size.to_pixels(window.rem_size());
+    let line_height = window.pixel_snap(
+        text_style
+            .line_height
+            .to_pixels(font_size.into(), window.rem_size()),
+    );
+    TextMeasureInputs {
+        text,
+        runs,
+        text_style,
+        font_size,
+        line_height,
+        layout: RefCell::new(layout.clone()),
+    }
+}
+
+/// [`TextLayout`]'s prepaint: notes the bounds the text is painted in.
+///
+/// Text should be measured by the time it is prepainted: carried over from
+/// last frame as its layout is requested, or by Taffy as it lays the text's
+/// node out. Should a gap in retention let text reach prepaint without a
+/// measurement (a node no layout computed this frame reaches, say), upstream
+/// panics here. It is measured here instead, as plain text in the text style
+/// in effect at the size it is prepainted at, so that the frame degrades
+/// (the text loses its runs' colors and fonts for a frame) rather than the
+/// app aborting.
+pub(crate) fn prepaint_text(
+    layout: &TextLayout,
+    bounds: Bounds<Pixels>,
+    text: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if layout.0.borrow().is_none() {
+        report_unmeasured(
+            "text reached prepaint unmeasured; measured there as plain text",
+            text,
+        );
+        let inputs = measure_inputs(
+            layout,
+            SharedString::from(text.to_owned()),
+            Vec::new(),
+            window,
+        );
+        // A node no layout reached has no size: lay the text out unwrapped
+        // rather than a glyph to a line.
+        let (known, available) = if bounds.size.width > Pixels::ZERO {
+            (
+                bounds.size.map(Some),
+                bounds.size.map(AvailableSpace::Definite),
+            )
+        } else {
+            (
+                Size::default(),
+                Size::new(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+            )
+        };
+        measure_text(&inputs, known, available, window, cx);
+    }
+    if let Some(inner) = layout.0.borrow_mut().as_mut() {
+        inner.bounds = Some(bounds);
+    }
+}
+
+/// Whether [`TextLayout`]'s paint can paint the text: it was measured and
+/// prepainted. Upstream panics when it was not; it is left unpainted instead.
+/// See [`prepaint_text`].
+pub(crate) fn paintable(layout: &TextLayout, text: &str) -> bool {
+    let paintable = layout
+        .0
+        .borrow()
+        .as_ref()
+        .is_some_and(|inner| inner.bounds.is_some());
+    if !paintable {
+        report_unmeasured(
+            "text painted before it was measured and prepainted; not painted",
+            text,
+        );
+    }
+    paintable
+}
+
+/// Whether [`report_unmeasured`] has reported anything in this process.
+static REPORTED_UNMEASURED: AtomicBool = AtomicBool::new(false);
+
+/// Logs text found unmeasured where it should not be: as an error the first
+/// time, and at debug level after that, since a frame that finds it is likely
+/// to be followed by many that find it again.
+fn report_unmeasured(what: &str, text: &str) {
+    const SHOWN_CHARS: usize = 32;
+    let mut shown: String = text.chars().take(SHOWN_CHARS).collect();
+    if text.chars().nth(SHOWN_CHARS).is_some() {
+        shown.push('…');
+    }
+    if REPORTED_UNMEASURED.swap(true, Ordering::Relaxed) {
+        log::debug!("{what}: {shown:?}");
+    } else {
+        log::error!("{what}: {shown:?}");
+    }
 }
 
 /// Takes over the measurement `previous` left, if it stands for `inputs`. See
@@ -266,7 +362,8 @@ fn forget_measurement(inputs: &TextMeasureInputs) {
 ///   a wrapping leaf is measured unconstrained and then again at the width it
 ///   ends up with. Text that came out narrower than the width now on offer
 ///   wraps nowhere, and the lines shaped without a wrap width are the same
-///   lines, so that is answered from what is already there.
+///   lines, so that is answered from what is already there. The other way
+///   round holds only for text that wrapped nowhere at its width.
 /// - Which affix to truncate with, and the line wrapper truncation needs, are
 ///   worked out only when the text truncates and has to be shaped: resolving
 ///   the font and borrowing a wrapper from the pool on every measurement was
@@ -307,13 +404,22 @@ fn measure_text(
     });
 
     // A kept measurement answers when the wrap width is one it was taken at,
-    // or one it fits within unwrapped, unless truncation is involved either
-    // way: a truncated layout would answer an unconstrained probe with the
-    // truncated size.
+    // an unconstrained probe when it wrapped nowhere, or a wrap width it fits
+    // within unwrapped, unless truncation is involved either way: a truncated
+    // layout would answer an unconstrained probe with the truncated size.
+    // Text wrapped at a width is only as wide as that width, and Taffy can
+    // measure a retained leaf narrow after laying it out (see
+    // `text_laid_out_from_the_cache_paints_the_lines_of_its_box`): answering
+    // an unconstrained probe with that would size a box as wide as its
+    // content to the narrow width, for good.
     if let Some(text_layout) = layout.0.borrow().as_ref()
         && let Some(size) = text_layout.size
-        && (wrap_width.is_none()
-            || wrap_width == text_layout.wrap_width
+        && (wrap_width == text_layout.wrap_width
+            || (wrap_width.is_none()
+                && text_layout
+                    .lines
+                    .iter()
+                    .all(|line| line.wrap_boundaries.is_empty()))
             || (text_layout.wrap_width.is_none()
                 && wrap_width.is_some_and(|wrap_width| size.width <= wrap_width)))
         && truncate_width.is_none()
@@ -1007,41 +1113,147 @@ pub(crate) fn resolve_font(text_system: &crate::TextSystem, font: &crate::Font) 
 }
 
 /// [`TextSystem::resolve_font`]: the font, or else the first of the
-/// fallbacks that resolves — in the weight and style asked for, with the
-/// features asked for, where the fallback family has them.
+/// fallbacks that resolves with the features asked for, or else upstream's
+/// plain fallback.
 ///
-/// Upstream resolves a fallback as the fallback stack names it, plain: text
-/// asked for in bold came out regular, and with its features — tabular
-/// numerals, say — dropped, so digits of a family that isn't installed took
-/// their proportional widths, and a ticking price changed width, and laid
-/// out its row again, every time it changed.
+/// Upstream resolves a fallback as the fallback stack names it, plain: its
+/// features — tabular numerals, say — dropped, so digits of a family that
+/// isn't installed took their proportional widths, and a ticking price
+/// changed width, and laid out its row again, every time it changed. The
+/// fallback's weight and style stay upstream's.
 fn resolve_font_uncached(text_system: &crate::TextSystem, font: &crate::Font) -> crate::FontId {
-    if let Ok(font_id) = text_system.font_id(font) {
+    if let Some(
+        crate::text_system::CachedFont::Direct(font_id)
+        | crate::text_system::CachedFont::Fallback(font_id),
+    ) = text_system.font_ids_by_font.read().get(font)
+    {
+        return *font_id;
+    }
+    let mut font_error = None;
+    if let Some(font_id) = cached_font_id(text_system, font, font, &mut font_error) {
         return font_id;
     }
     for fallback in &text_system.fallback_font_stack {
         let as_asked = crate::Font {
-            family: fallback.family.clone(),
             features: font.features.clone(),
-            fallbacks: font.fallbacks.clone(),
-            weight: font.weight,
-            style: font.style,
+            ..fallback.clone()
         };
-        if let Ok(font_id) = text_system.font_id(&as_asked) {
-            return font_id;
-        }
-        if let Ok(font_id) = text_system.font_id(fallback) {
+        if let Some(font_id) = cached_font_id(text_system, &as_asked, font, &mut font_error) {
+            if let Some(error) = font_error {
+                log::warn!("failed to load font {font:?}: {error:#}");
+            }
+            text_system.font_ids_by_font.write().insert(
+                font.clone(),
+                crate::text_system::CachedFont::Fallback(font_id),
+            );
             return font_id;
         }
     }
-    panic!(
-        "failed to resolve font '{}' or any of the fallbacks: {}",
-        font.family,
+    // No fallback has the font as asked: upstream's resolution takes the
+    // first fallback as the stack names it, or panics.
+    text_system.resolve_font_uncached(font)
+}
+
+/// `candidate`'s own font id, looked up once per text system and remembered
+/// in upstream's cache, misses included. Only a miss for the font `asked`
+/// for is reported, as upstream reports only explicitly requested fonts.
+fn cached_font_id(
+    text_system: &crate::TextSystem,
+    candidate: &crate::Font,
+    asked: &crate::Font,
+    font_error: &mut Option<Arc<anyhow::Error>>,
+) -> Option<crate::FontId> {
+    use crate::text_system::CachedFont;
+    let cached = text_system.font_ids_by_font.read().get(candidate).cloned();
+    let cached = cached.unwrap_or_else(|| {
+        let cached = match text_system.platform_text_system.font_id(candidate) {
+            Ok(font_id) => CachedFont::Direct(font_id),
+            Err(error) => CachedFont::Missing(Arc::new(error)),
+        };
         text_system
-            .fallback_font_stack
-            .iter()
-            .map(|fallback| fallback.family.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+            .font_ids_by_font
+            .write()
+            .insert(candidate.clone(), cached.clone());
+        cached
+    });
+    match cached {
+        CachedFont::Direct(font_id) => Some(font_id),
+        CachedFont::Fallback(_) => None,
+        CachedFont::Missing(error) => {
+            if candidate == asked {
+                *font_error = Some(error);
+            }
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TextMeasureInputs, measure_text};
+    use crate::{AppContext as _, AvailableSpace, Size, TestAppContext, TextLayout, px};
+    use std::cell::RefCell;
+
+    /// Taffy can measure a retained leaf under other constraints after it has
+    /// been laid out: at width zero, say, when a node above it is sized to its
+    /// content again. Text it wrapped there must not answer a later probe for
+    /// its unwrapped width with the width it wrapped to: a box as wide as its
+    /// content would take that width, the text would wrap in it, and the box
+    /// would stay that narrow with room for the text on one line.
+    #[test]
+    fn text_wrapped_narrow_does_not_answer_for_its_unwrapped_width() {
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| crate::Empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            let text_style = crate::fast::text_style::text_style(window);
+            let font_size = text_style.font_size.to_pixels(window.rem_size());
+            let line_height = text_style
+                .line_height
+                .to_pixels(font_size.into(), window.rem_size());
+            let inputs = TextMeasureInputs {
+                text: "the quick brown fox jumps over the lazy dog".into(),
+                runs: Vec::new(),
+                text_style,
+                font_size,
+                line_height,
+                layout: RefCell::new(TextLayout::default()),
+            };
+            let probe = |width| Size {
+                width,
+                height: AvailableSpace::MaxContent,
+            };
+            let unwrapped = measure_text(
+                &inputs,
+                Size::default(),
+                probe(AvailableSpace::MaxContent),
+                window,
+                cx,
+            );
+
+            let narrow = px(40.);
+            let wrapped = measure_text(
+                &inputs,
+                Size {
+                    width: Some(narrow),
+                    height: None,
+                },
+                probe(AvailableSpace::Definite(narrow)),
+                window,
+                cx,
+            );
+            assert!(
+                wrapped.width < unwrapped.width,
+                "the text should wrap at {narrow:?}: {wrapped:?}, unwrapped {unwrapped:?}"
+            );
+
+            for width in [AvailableSpace::MaxContent, AvailableSpace::MinContent] {
+                assert_eq!(
+                    measure_text(&inputs, Size::default(), probe(width), window, cx),
+                    unwrapped,
+                    "probed under {width:?} after wrapping at {narrow:?}"
+                );
+            }
+        })
+        .unwrap();
+    }
 }

@@ -49,6 +49,42 @@ use crate::fast::layers::tile_cache::create_globals;
 
 const TILE: u32 = 512;
 
+#[cfg(feature = "test-support")]
+#[path = "../../../../gpui/src/fast/rounded_clip_fixtures.rs"]
+mod rounded_clip_tests;
+
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn rounded_overflow_retained_child_follows_ancestor_clip(cx: &mut gpui::TestAppContext) {
+    let mut harness = Harness::new().expect("retained clipping regression requires a GPU");
+    rounded_clip_tests::retained_frames(cx, |scene, size| {
+        harness.render(scene, size, rgba(0xffffffff))
+    });
+}
+
+#[cfg(feature = "test-support")]
+fn render_div_fixture(cx: &mut gpui::TestAppContext, build: fn() -> gpui::Div) -> (Vec<u8>, usize) {
+    let mut harness =
+        Harness::new().expect("rounded clipping regression requires Direct3D or WARP");
+    rounded_clip_tests::render_with(cx, build, |scene, size| {
+        harness.render(scene, size, rgba(0xffffffff))
+    })
+}
+
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn rounded_overflow_inside_scroll_tiles_matches_direct_pixels(cx: &mut gpui::TestAppContext) {
+    let mut harness =
+        Harness::new().expect("rounded clipping regression requires Direct3D or WARP");
+    rounded_clip_tests::render_with(cx, rounded_clip_tests::square_fixture, |scene, size| {
+        let direct = harness.render(scene, size, rgba(0xffffffff));
+        let tiled = rounded_clip_tests::tiled_scene(scene, size);
+        let actual = harness.render(&tiled, size, rgba(0xffffffff));
+        assert_same_pixels(&actual, &direct, size.width.0 as usize);
+        actual
+    });
+}
+
 #[test]
 fn harness_renders_a_quad_at_the_right_pixels() {
     let Some(mut harness) = Harness::new() else {

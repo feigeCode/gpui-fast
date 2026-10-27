@@ -26,7 +26,7 @@ use std::{cell::Cell, rc::Rc};
 
 use gpui::{
     Bounds, Hsla, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, ScrollHandle, ScrollWheelEvent, UniformListScrollHandle, canvas, fill, hsla, point,
+    Point, ScrollEvent, ScrollHandle, UniformListScrollHandle, canvas, fill, hsla, point,
     prelude::*, px, size,
 };
 
@@ -182,7 +182,7 @@ pub fn scrollbar(scrolled: Scrolled, state: Rc<Cell<State>>) -> impl IntoElement
             window.on_mouse_event({
                 let scrolled = scrolled.clone();
                 let state = state.clone();
-                move |event: &ScrollWheelEvent, phase, _, cx| {
+                move |event: &ScrollEvent, phase, _, cx| {
                     if phase.bubble() && bounds.contains(&event.position) {
                         let offset = scrolled.offset();
                         let mut current = state.get();

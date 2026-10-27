@@ -47,8 +47,8 @@
 
 use gpui::{
     AnyElement, AnyView, App, Context, Entity, FontWeight, Hsla, ListAlignment, ListState,
-    Modifiers, PlatformInput, Render, ScrollDelta, ScrollWheelEvent, SharedString, StyledText,
-    TextRun, TouchPhase, WeakEntity, Window, div, font, hsla, list, point, prelude::*, px,
+    Modifiers, PlatformInput, Render, ScrollDelta, ScrollEvent, SharedString, StyledText, TextRun,
+    TouchPhase, WeakEntity, Window, div, font, hsla, list, point, prelude::*, px,
 };
 
 use crate::Scenario;
@@ -568,11 +568,12 @@ impl Render for Transcript {
 fn wheel(frame: usize) -> PlatformInput {
     let up = (frame / FRAMES_PER_SWEEP).is_multiple_of(2);
     let delta = if up { WHEEL_STEP } else { -WHEEL_STEP };
-    PlatformInput::ScrollWheel(ScrollWheelEvent {
+    PlatformInput::Scroll(ScrollEvent {
         position: point(px(720.), px(450.)),
         delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
         modifiers: Modifiers::default(),
         touch_phase: TouchPhase::Moved,
+        ..Default::default()
     })
 }
 
@@ -775,11 +776,12 @@ impl Render for SidebarChatApp {
 fn sidebar_wheel(frame: usize) -> PlatformInput {
     let down = (frame / FRAMES_PER_SWEEP).is_multiple_of(2);
     let delta = if down { -WHEEL_STEP } else { WHEEL_STEP };
-    PlatformInput::ScrollWheel(ScrollWheelEvent {
+    PlatformInput::Scroll(ScrollEvent {
         position: point(px(SIDEBAR_WIDTH / 2.), px(450.)),
         delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
         modifiers: Modifiers::default(),
         touch_phase: TouchPhase::Moved,
+        ..Default::default()
     })
 }
 

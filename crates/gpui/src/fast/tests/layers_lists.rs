@@ -5,7 +5,7 @@
 use crate::fast::layers::policy::{Decision, last_decision};
 use crate::{
     AnyWindowHandle, App, AppContext as _, Bounds, GlobalElementId, Hsla, ScaledPixels, Scene,
-    ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, Window, point, px,
+    ScrollDelta, ScrollEvent, TestAppContext, TouchPhase, Window, point, px,
 };
 
 /// How tall the list is, in pixels.
@@ -34,11 +34,12 @@ fn wheel(cx: &mut TestAppContext, window: AnyWindowHandle, dy: f32) {
     let frame = with_window(cx, window, |window, _| window.fast_layers.frame);
     with_window(cx, window, |window, cx| {
         window.dispatch_event(
-            crate::PlatformInput::ScrollWheel(ScrollWheelEvent {
+            crate::PlatformInput::Scroll(ScrollEvent {
                 position: point(px(20.), px(20.)),
                 delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                 modifiers: Default::default(),
                 touch_phase: TouchPhase::Moved,
+                ..Default::default()
             }),
             cx,
         );
@@ -847,9 +848,9 @@ mod list {
         wheel, wheel_deltas, with_window,
     };
     use crate::{
-        AnyWindowHandle, AppContext as _, Context, Entity, IntoElement, ListAlignment, ListState,
-        ParentElement as _, Render, Styled as _, TestAppContext, Window, WindowHandle, div,
-        prelude::FluentBuilder as _, px, rgb,
+        AnyWindowHandle, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+        ListAlignment, ListState, ParentElement as _, Render, Styled as _, TestAppContext, Window,
+        WindowHandle, div, prelude::FluentBuilder as _, px, rgb,
     };
     use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
@@ -2645,6 +2646,91 @@ mod list {
         let composited = compare_with_layers_off(cx, with, without, &[-7.; 8], "widened");
         assert!(composited > 0, "the layer was composited");
     }
+
+    /// A white panel holding a list of rows of varying heights, 100 px tall,
+    /// each row found in tests as `row-<ix>`.
+    struct LabelledListPage {
+        state: ListState,
+    }
+
+    impl Render for LabelledListPage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().bg(rgb(0xffffff)).child(
+                crate::list(self.state.clone(), move |row, _, _| {
+                    div()
+                        .debug_selector(move || format!("row-{row}"))
+                        .w(px(VIEWPORT_WIDTH))
+                        .h(px(row_height(row)))
+                        .bg(row_color(row))
+                        .into_any_element()
+                })
+                .w(px(VIEWPORT_WIDTH))
+                .h(px(VIEWPORT_HEIGHT)),
+            )
+        }
+    }
+
+    /// The rows of the list in `window` that its viewport shows, as the
+    /// frame last drawn records them for tests to find.
+    fn rows_shown(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<(usize, String)> {
+        with_window(cx, window, |window, _| {
+            let viewport = crate::Bounds::new(
+                crate::point(px(0.), px(0.)),
+                crate::size(px(VIEWPORT_WIDTH), px(VIEWPORT_HEIGHT)),
+            );
+            let mut rows: Vec<(usize, String)> = window
+                .rendered_frame
+                .debug_bounds
+                .iter()
+                .filter_map(|(selector, bounds)| {
+                    let row = selector.strip_prefix("row-")?.parse().ok()?;
+                    viewport
+                        .intersects(bounds)
+                        .then(|| (row, format!("{bounds:?}")))
+                })
+                .collect();
+            rows.sort();
+            rows
+        })
+    }
+
+    /// The rows a list's layer keeps on a frame that only scrolled it are
+    /// found where they are drawn, as a list without a layer finds them.
+    #[crate::test]
+    fn rows_a_layer_keeps_are_found_where_they_are_drawn(cx: &mut TestAppContext) {
+        if !crate::fast::layers::COMPILED {
+            return;
+        }
+        let open = |cx: &mut TestAppContext| -> AnyWindowHandle {
+            let state = ListState::new(300, ListAlignment::Top, px(0.)).measure_all();
+            let window = cx.add_window(move |_, _| LabelledListPage { state });
+            open_at(cx, window.into(), 1.);
+            window.into()
+        };
+        let with_layers = open(cx);
+        let without_layers = open(cx);
+        with_window(cx, without_layers, |window, _| {
+            window.set_scroll_layers(false)
+        });
+        draw(cx, without_layers);
+
+        let extended = extended_frames();
+        for (step, dy) in wheel_deltas(40).into_iter().enumerate() {
+            wheel(cx, with_layers, dy);
+            wheel(cx, without_layers, dy);
+            let expected = rows_shown(cx, without_layers);
+            assert!(!expected.is_empty(), "step {step}: rows are shown");
+            assert_eq!(
+                rows_shown(cx, with_layers),
+                expected,
+                "step {step}, scrolled by {dy}"
+            );
+        }
+        assert!(
+            extended_frames() - extended > 20,
+            "frames kept the rows the layer held"
+        );
+    }
 }
 
 /// Lists whose rows hand the frame more than what they draw: hitboxes,
@@ -2655,9 +2741,9 @@ mod rows {
         expanded_quads, held_rows, open_at, row_color, wheel, with_window,
     };
     use crate::{
-        AnyWindowHandle, AppContext as _, Bounds, Context, Entity, IntoElement, ListAlignment,
-        ListState, ParentElement as _, Pixels, Render, StatefulInteractiveElement as _,
-        Styled as _, TestAppContext, Window, div, px, rgb,
+        AnyWindowHandle, AppContext as _, Bounds, Context, CursorStyle, Entity, IntoElement,
+        ListAlignment, ListState, ParentElement as _, Pixels, Render,
+        StatefulInteractiveElement as _, Styled as _, TestAppContext, Window, div, px, rgb,
     };
     use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
@@ -2887,10 +2973,10 @@ mod rows {
         }
     }
 
-    /// While a wheel scrolls rows under a still pointer, hover is held
-    /// still: nothing is hovered, no row is rendered again for its hover,
-    /// and the list stays composited on every frame. A pointer that moves
-    /// hovers what is under it again at once.
+    /// While a wheel scrolls rows under a still pointer, hover styling is held
+    /// still: no row is rendered again for its hover, and the list stays
+    /// composited on every frame. The hit test stays the geometry under the
+    /// pointer. A pointer that moves hovers what is under it again at once.
     #[crate::test]
     fn hover_held_still_while_the_wheel_scrolls_renders_no_row_for_it(cx: &mut TestAppContext) {
         if !crate::fast::layers::COMPILED {
@@ -2912,8 +2998,11 @@ mod rows {
                     "uniform {uniform}, frame {frame}"
                 );
                 assert!(
-                    with_window(cx, window, |window, _| window.mouse_hit_test.ids.is_empty()),
-                    "uniform {uniform}, frame {frame}: nothing is hovered"
+                    with_window(cx, window, |window, _| {
+                        !window.mouse_hit_test.ids.is_empty()
+                            && crate::fast::layers::hover_freeze::frozen(window)
+                    }),
+                    "uniform {uniform}, frame {frame}: the geometry stays while hover is held still"
                 );
             }
             assert_eq!(
@@ -2934,13 +3023,147 @@ mod rows {
             });
             draw(cx, window);
             assert!(
-                with_window(cx, window, |window, _| !window
-                    .mouse_hit_test
-                    .ids
-                    .is_empty()),
+                with_window(cx, window, |window, _| {
+                    window
+                        .rendered_frame
+                        .hitboxes
+                        .iter()
+                        .any(|hitbox| hitbox.is_hovered(window))
+                }),
                 "uniform {uniform}: the moved pointer hovers the row under it"
             );
         }
+    }
+
+    /// The platform cursor stays the text cursor while a wheel scrolls under a
+    /// still pointer. Hover styling is held still over that text. Moving the
+    /// pointer off the text sets the arrow.
+    #[crate::test]
+    fn the_cursor_follows_the_text_under_a_still_pointer_while_hover_is_frozen(
+        cx: &mut TestAppContext,
+    ) {
+        struct TextPage;
+
+        impl Render for TextPage {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(div().w(px(40.)).h(px(40.)).cursor(CursorStyle::IBeam))
+            }
+        }
+
+        let window = cx.add_window(|_, _| TextPage).into();
+        with_window(cx, window, |window, _| {
+            window.set_owns_pointer(true);
+            window.set_hover_freeze(true);
+        });
+        open_at(cx, window, 1.);
+        assert_eq!(
+            cx.test_platform().active_cursor_style(),
+            CursorStyle::IBeam,
+            "the text under the pointer sets the cursor before the wheel"
+        );
+
+        for frame in 0..8 {
+            wheel(cx, window, -7.);
+            assert_eq!(
+                cx.test_platform().active_cursor_style(),
+                CursorStyle::IBeam,
+                "frame {frame}: the cursor stays the text cursor while hover is held still"
+            );
+            assert!(
+                with_window(cx, window, |window, _| {
+                    !window.mouse_hit_test.ids.is_empty()
+                        && crate::fast::layers::hover_freeze::frozen(window)
+                }),
+                "frame {frame}: the geometry stays while hover is held still"
+            );
+        }
+
+        with_window(cx, window, |window, cx| {
+            window.dispatch_event(
+                crate::PlatformInput::MouseMove(crate::MouseMoveEvent {
+                    position: crate::point(px(80.), px(80.)),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }),
+                cx,
+            );
+        });
+        draw(cx, window);
+        assert_eq!(
+            cx.test_platform().active_cursor_style(),
+            CursorStyle::Arrow,
+            "the pointer off the text sets the arrow"
+        );
+    }
+
+    /// A click under a still pointer right after the wheel reaches its
+    /// handler. Hover styling is held still while frames are drawn; events
+    /// dispatched between them read the geometry under the pointer.
+    #[crate::test]
+    fn a_click_under_a_still_pointer_right_after_the_wheel_reaches_its_handler(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::InteractiveElement as _;
+
+        struct ClickPage {
+            clicks: Rc<RefCell<usize>>,
+        }
+
+        impl Render for ClickPage {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicks = self.clicks.clone();
+                div().size_full().child(
+                    div()
+                        .id("button")
+                        .w(px(40.))
+                        .h(px(40.))
+                        .on_click(move |_, _, _| *clicks.borrow_mut() += 1),
+                )
+            }
+        }
+
+        let clicks = Rc::new(RefCell::new(0));
+        let window = cx
+            .add_window({
+                let clicks = clicks.clone();
+                move |_, _| ClickPage { clicks }
+            })
+            .into();
+        with_window(cx, window, |window, _| window.set_hover_freeze(true));
+        open_at(cx, window, 1.);
+        wheel(cx, window, -7.);
+        assert!(
+            with_window(cx, window, |window, _| {
+                crate::fast::layers::hover_freeze::frozen(window)
+            }),
+            "the wheel holds hover still"
+        );
+
+        let position = crate::point(px(20.), px(20.));
+        with_window(cx, window, |window, cx| {
+            window.dispatch_event(
+                crate::PlatformInput::MouseDown(crate::MouseDownEvent {
+                    button: crate::MouseButton::Left,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                crate::PlatformInput::MouseUp(crate::MouseUpEvent {
+                    button: crate::MouseButton::Left,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+        });
+        assert_eq!(*clicks.borrow(), 1, "the click reached its handler");
     }
 
     /// A list whose rows take input (a hover style: a hitbox, a listener,
@@ -3481,11 +3704,12 @@ mod animation {
         with_window(cx, window, |window, cx| {
             window.simulate_next_frame(cx);
             window.dispatch_event(
-                crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                crate::PlatformInput::Scroll(crate::ScrollEvent {
                     position: crate::point(px(20.), px(20.)),
                     delta: crate::ScrollDelta::Pixels(crate::point(px(0.), px(dy))),
                     modifiers: Default::default(),
                     touch_phase: crate::TouchPhase::Moved,
+                    ..Default::default()
                 }),
                 cx,
             );
@@ -3712,5 +3936,623 @@ mod page_switch {
     #[crate::test]
     fn a_list_switched_to_another_page_shows_the_new_page(cx: &mut TestAppContext) {
         run(cx, true);
+    }
+}
+
+/// List rows that take element state while they are rendered and laid
+/// out, as a text view takes its parsed document. Such rows are often
+/// Markdown replies taller than the list.
+mod layout_states {
+    use super::{Decision, decision, draw, expanded_quads, open_at, row_color, with_window};
+    use crate::{
+        AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Context, Element, ElementId,
+        FollowMode, GlobalElementId, InspectorElementId, IntoElement, LayoutId, ListAlignment,
+        ListSizingBehavior, ListState, ParentElement as _, Pixels, Render, ScrollDelta,
+        ScrollEvent, Styled as _, Task, TestAppContext, TouchPhase, Window, WindowHandle, div,
+        point, px, rgb,
+    };
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+
+    /// How many rows the list has.
+    const ROWS: usize = 40;
+    /// How wide the list is, in pixels.
+    const WIDTH: f32 = 200.;
+    /// How tall the list is, in pixels.
+    const VIEWPORT: f32 = 200.;
+    /// How tall a parsed document is, in pixels.
+    const DOCUMENT_HEIGHT: f32 = 900.;
+
+    /// How many documents each row created.
+    type Created = Rc<RefCell<BTreeMap<usize, usize>>>;
+
+    /// A document a row shows, parsed in the background: 16 px tall until
+    /// it is parsed, as a text view's empty document is.
+    struct Document {
+        row: usize,
+        parsed: bool,
+        _parse: Task<()>,
+    }
+
+    impl Document {
+        /// Takes the document of the row `row` as element state keyed by
+        /// `key`, creating it, and counting it in `created`, if there is
+        /// none.
+        fn take(
+            key: &'static str,
+            row: usize,
+            created: &Created,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> crate::Entity<Document> {
+            let created = created.clone();
+            window.use_keyed_state(key, cx, move |_, cx| {
+                *created.borrow_mut().entry(row).or_default() += 1;
+                Document::new(row, cx)
+            })
+        }
+
+        fn new(row: usize, cx: &mut Context<Self>) -> Self {
+            let parse = cx.spawn(async move |this, cx| {
+                this.update(cx, |document, cx| {
+                    document.parsed = true;
+                    cx.notify();
+                })
+                .ok();
+            });
+            Document {
+                row,
+                parsed: false,
+                _parse: parse,
+            }
+        }
+    }
+
+    impl Render for Document {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let row = self.row;
+            let height = if self.parsed { DOCUMENT_HEIGHT } else { 16. };
+            // A stripe every 100 px, so that where the row lies shows.
+            let stripes = (height / 100.).ceil() as usize;
+            div()
+                .flex()
+                .flex_col()
+                .w(px(WIDTH))
+                .h(px(height))
+                .bg(row_color(row))
+                .children((0..stripes).map(move |stripe| {
+                    div()
+                        .w(px(WIDTH / 2.))
+                        .h(px((height - stripe as f32 * 100.).min(100.) / 2.))
+                        .bg(row_color(row * 13 + stripe + 1))
+                }))
+        }
+    }
+
+    /// An element showing a [`Document`] it keeps as its element state,
+    /// taken as it is laid out, as a text view does.
+    struct TextView {
+        row: usize,
+        created: Created,
+    }
+
+    impl IntoElement for TextView {
+        type Element = Self;
+
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for TextView {
+        type RequestLayoutState = AnyElement;
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            Some(ElementId::NamedInteger("text".into(), self.row as u64))
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, AnyElement) {
+            let document = Document::take("document", self.row, &self.created, window, cx);
+            let mut element = div().child(document).into_any_element();
+            (element.request_layout(window, cx), element)
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            element: &mut AnyElement,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            element.prepaint(window, cx);
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            element: &mut AnyElement,
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            element.paint(window, cx);
+        }
+    }
+
+    /// When the row showing a [`DocumentPage`]'s document takes it.
+    #[derive(Clone, Copy)]
+    enum Takes {
+        /// As a [`TextView`] in the row is laid out.
+        AsLaidOut,
+        /// As the row is rendered. The row also holds a list sized by its
+        /// rows, which lays them out as the row is laid out.
+        AsRenderedBesideList,
+    }
+
+    /// A white panel holding a list of [`ROWS`] rows, 20 to 40 px tall but
+    /// for the row `document`, which shows a [`Document`], at the top left
+    /// of the window.
+    struct DocumentPage {
+        state: ListState,
+        document: usize,
+        takes: Takes,
+        /// The state of the list the document's row holds beside it.
+        inner: ListState,
+        created: Created,
+    }
+
+    impl Render for DocumentPage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (document, takes) = (self.document, self.takes);
+            let (inner, created) = (self.inner.clone(), self.created.clone());
+            div().size_full().bg(rgb(0xffffff)).child(
+                crate::list(self.state.clone(), move |row, window, cx| {
+                    let element = div().w(px(WIDTH));
+                    if row != document {
+                        return element
+                            .h(px(20. + (row % 3) as f32 * 10.))
+                            .bg(row_color(row))
+                            .into_any_element();
+                    }
+                    let created = created.clone();
+                    match takes {
+                        Takes::AsLaidOut => element.child(TextView { row, created }),
+                        Takes::AsRenderedBesideList => element
+                            .flex()
+                            .flex_col()
+                            .child(Document::take("document", row, &created, window, cx))
+                            .child(
+                                crate::list(inner.clone(), |ix, _, _| {
+                                    div()
+                                        .w(px(WIDTH))
+                                        .h(px(20.))
+                                        .bg(row_color(ix + 50))
+                                        .into_any_element()
+                                })
+                                .with_sizing_behavior(ListSizingBehavior::Infer)
+                                .w(px(WIDTH)),
+                            ),
+                    }
+                    .into_any_element()
+                })
+                .w(px(WIDTH))
+                .h(px(VIEWPORT)),
+            )
+        }
+    }
+
+    /// Opens a [`DocumentPage`] at a scale of 2, its list following its
+    /// tail when `tail`, and draws it once its document is parsed.
+    fn open(
+        cx: &mut TestAppContext,
+        document: usize,
+        tail: bool,
+        takes: Takes,
+    ) -> (WindowHandle<DocumentPage>, Created) {
+        let state = ListState::new(ROWS, ListAlignment::Top, px(160.));
+        if tail {
+            state.set_follow_mode(FollowMode::Tail);
+        }
+        let created = Created::default();
+        let page_created = created.clone();
+        let window = cx.add_window(move |_, _| DocumentPage {
+            state,
+            document,
+            takes,
+            inner: ListState::new(3, ListAlignment::Top, px(100.)),
+            created: page_created,
+        });
+        open_at(cx, window.into(), 2.);
+        cx.run_until_parked();
+        draw(cx, window.into());
+        (window, created)
+    }
+
+    /// Scrolls `window` by `delta` with the wheel over the list, and draws
+    /// the frame that follows, unless the scroll drew it.
+    fn scroll(cx: &mut TestAppContext, window: AnyWindowHandle, delta: ScrollDelta) {
+        let frame = with_window(cx, window, |window, _| window.fast_layers.frame);
+        with_window(cx, window, |window, cx| {
+            window.dispatch_event(
+                crate::PlatformInput::Scroll(ScrollEvent {
+                    position: point(px(20.), px(20.)),
+                    delta,
+                    modifiers: Default::default(),
+                    touch_phase: TouchPhase::Moved,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+        if with_window(cx, window, |window, _| window.fast_layers.frame) == frame {
+            draw(cx, window);
+        }
+    }
+
+    /// Every other step, renders the root view of each of `windows`, which
+    /// holds the list, again, as an app's view does when it tracks which
+    /// rows its list shows; then lets any document created anew be parsed,
+    /// and draws the windows that changed. Calls `check` after each frame.
+    fn render_again_and_settle(
+        cx: &mut TestAppContext,
+        step: usize,
+        windows: &[AnyWindowHandle],
+        mut check: impl FnMut(&mut TestAppContext, &str),
+    ) {
+        if step % 2 == 1 {
+            for window in windows {
+                cx.update_window(*window, |view, _, cx| cx.notify(view.entity_id()))
+                    .unwrap();
+            }
+            for window in windows {
+                draw(cx, *window);
+            }
+            check(cx, &format!("step {step}, rendered again"));
+        }
+        cx.run_until_parked();
+        for window in windows {
+            if with_window(cx, *window, |window, _| window.invalidator.is_dirty()) {
+                draw(cx, *window);
+            }
+        }
+        check(cx, &format!("step {step}, settled"));
+    }
+
+    /// Opens two [`DocumentPage`]s whose row `document` takes its document
+    /// as `takes` says, one drawn without layers, and scrolls both `steps`
+    /// times by `delta`, ending with the document's row still at the top of
+    /// the list. Every other step the view holding the list renders again.
+    /// Checks after each frame that both windows draw the same quads, and at
+    /// the end that each window created its document once.
+    fn scroll_through_document(
+        cx: &mut TestAppContext,
+        document: usize,
+        tail: bool,
+        takes: Takes,
+        delta: ScrollDelta,
+        steps: usize,
+    ) {
+        if !crate::fast::layers::COMPILED {
+            return;
+        }
+        let (with_layers, created_with) = open(cx, document, tail, takes);
+        let (without_layers, created_without) = open(cx, document, tail, takes);
+        let windows: [AnyWindowHandle; 2] = [with_layers.into(), without_layers.into()];
+        with_window(cx, windows[1], |window, _| window.set_scroll_layers(false));
+        draw(cx, windows[1]);
+        let same = |cx: &mut TestAppContext, label: &str| {
+            let expected = with_window(cx, windows[1], |window, _| {
+                expanded_quads(&window.rendered_frame.scene)
+            });
+            let actual = with_window(cx, windows[0], |window, _| {
+                expanded_quads(&window.rendered_frame.scene)
+            });
+            assert_eq!(actual, expected, "{label}");
+        };
+        let mut composited = 0;
+        for step in 0..steps {
+            for window in windows {
+                scroll(cx, window, delta);
+            }
+            if decision(cx, windows[0]) == Some(Decision::Composite) {
+                composited += 1;
+            }
+            same(cx, &format!("step {step}, scrolled"));
+            render_again_and_settle(cx, step, &windows, same);
+        }
+        let top = with_layers
+            .update(cx, |page, _, _| page.state.logical_scroll_top())
+            .unwrap();
+        assert_eq!(top.item_ix, document, "the document's row is at the top");
+        assert!(
+            composited > steps / 2,
+            "composited {composited} of {steps} frames"
+        );
+        let once = BTreeMap::from([(document, 1)]);
+        assert_eq!(*created_without.borrow(), once, "created without layers");
+        assert_eq!(*created_with.borrow(), once, "created with layers");
+    }
+
+    /// A list scrolled a few pixels at a time within a row taller than its
+    /// viewport keeps the row on its layer. The element state the row took
+    /// as it was laid out lies outside the row's prepaint records; the layer
+    /// keeps it with the row, so the row, rendered again, finds its document
+    /// parsed and keeps its height. Without that, every frame in which the
+    /// list's view renders again creates the document anew, unparsed, and
+    /// draws the rows below the shortened row until it is parsed.
+    #[crate::test]
+    fn a_tall_row_scrolled_by_pixels_keeps_the_state_its_layout_took(cx: &mut TestAppContext) {
+        let delta = ScrollDelta::Pixels(point(px(0.), px(-7.)));
+        scroll_through_document(cx, 1, false, Takes::AsLaidOut, delta, 100);
+    }
+
+    /// As above, scrolled up a line at a time from the end of a list that
+    /// follows its tail, its tall row third from last.
+    #[crate::test]
+    fn a_tall_row_scrolled_by_lines_keeps_the_state_its_layout_took(cx: &mut TestAppContext) {
+        let delta = ScrollDelta::Lines(point(0., 1.));
+        scroll_through_document(cx, ROWS - 3, true, Takes::AsLaidOut, delta, 36);
+    }
+
+    /// As above, the tall row taking its document as it is rendered, and
+    /// holding a list sized by its rows. Laying the tall row out renders that
+    /// list's rows; the state rendering the tall row took is still the tall
+    /// row's.
+    #[crate::test]
+    fn a_tall_row_holding_a_list_keeps_the_state_its_render_took(cx: &mut TestAppContext) {
+        let delta = ScrollDelta::Pixels(point(px(0.), px(-7.)));
+        scroll_through_document(cx, 1, false, Takes::AsRenderedBesideList, delta, 100);
+    }
+
+    /// A white panel holding a list of [`ROWS`] rows, 20 to 40 px tall, at
+    /// the top left of the window. Its row 1 holds a list sized by its rows,
+    /// whose 3 rows each show a [`TextView`] clipped to 20 px.
+    struct NestedPage {
+        state: ListState,
+        inner: ListState,
+        created: Created,
+    }
+
+    impl Render for NestedPage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (inner, created) = (self.inner.clone(), self.created.clone());
+            div().size_full().bg(rgb(0xffffff)).child(
+                crate::list(self.state.clone(), move |row, _, _| {
+                    if row != 1 {
+                        return div()
+                            .w(px(WIDTH))
+                            .h(px(20. + (row % 3) as f32 * 10.))
+                            .bg(row_color(row))
+                            .into_any_element();
+                    }
+                    let created = created.clone();
+                    crate::list(inner.clone(), move |row, _, _| {
+                        let created = created.clone();
+                        div()
+                            .w(px(WIDTH))
+                            .h(px(20.))
+                            .overflow_hidden()
+                            .child(TextView { row, created })
+                            .into_any_element()
+                    })
+                    .with_sizing_behavior(ListSizingBehavior::Infer)
+                    .w(px(WIDTH))
+                    .into_any_element()
+                })
+                .w(px(WIDTH))
+                .h(px(VIEWPORT)),
+            )
+        }
+    }
+
+    /// A list sized by its rows, in a row of a list with a layer, lays its
+    /// rows out as that row is laid out. The element states laying them out
+    /// takes are that row's, kept and dropped with it, not those of the
+    /// outer list's rows of the same indices.
+    #[crate::test]
+    fn a_list_in_a_row_lays_its_rows_out_as_part_of_that_row(cx: &mut TestAppContext) {
+        if !crate::fast::layers::COMPILED {
+            return;
+        }
+        let page = cx.add_window(move |_, _| NestedPage {
+            state: ListState::new(ROWS, ListAlignment::Top, px(160.)),
+            inner: ListState::new(3, ListAlignment::Top, px(100.)),
+            created: Created::default(),
+        });
+        let window: AnyWindowHandle = page.into();
+        open_at(cx, window, 2.);
+        let states = |cx: &mut TestAppContext, label: &str| {
+            let held = with_window(cx, window, |window, _| {
+                window
+                    .fast_layers
+                    .layers
+                    .values()
+                    .flat_map(|layer| layer.rows.held_layout_states())
+                    .filter(|(_, states)| *states > 0)
+                    .collect::<Vec<_>>()
+            });
+            assert!(
+                held.iter().all(|(row, states)| *row == 1 && *states == 3),
+                "{label}: element states held by row {held:?}"
+            );
+            !held.is_empty()
+        };
+        let mut held = false;
+        for step in 0..6 {
+            scroll(cx, window, ScrollDelta::Pixels(point(px(0.), px(-7.))));
+            held |= states(cx, &format!("step {step}, scrolled"));
+            render_again_and_settle(cx, step, &[window], |cx, label| {
+                states(cx, label);
+            });
+        }
+        assert!(held, "the layer held row 1 with its element states");
+    }
+
+    /// A white panel holding a uniform list of 300 rows, 20 px tall, each a
+    /// [`TextView`] clipped to the row, 100 px tall itself.
+    struct UniformPage {
+        created: Created,
+    }
+
+    impl Render for UniformPage {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let created = self.created.clone();
+            div().size_full().bg(rgb(0xffffff)).child(
+                crate::uniform_list(
+                    "list",
+                    300,
+                    cx.processor(move |_, range: std::ops::Range<usize>, _, _| {
+                        range
+                            .map(|row| {
+                                let created = created.clone();
+                                div()
+                                    .w(px(WIDTH))
+                                    .h(px(20.))
+                                    .overflow_hidden()
+                                    .child(TextView { row, created })
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .w(px(WIDTH))
+                .h(px(100.)),
+            )
+        }
+    }
+
+    /// A uniform list scrolled a few pixels at a time, its view rendering
+    /// again every other step, creates the documents of the rows it shows
+    /// throughout once, as it does without layers: the layer keeps the
+    /// element states laying out a row took with the row. The layer also
+    /// renders rows beyond the viewport, and drops them when it repaints
+    /// only the rows shown, so those may create theirs more than once.
+    /// Element states the list's render callback takes, rendering a range of
+    /// rows at once, are not known by row, and are not kept.
+    #[crate::test]
+    fn a_uniform_list_row_keeps_the_state_its_layout_took(cx: &mut TestAppContext) {
+        if !crate::fast::layers::COMPILED {
+            return;
+        }
+        for layers in [true, false] {
+            let created = Created::default();
+            let page_created = created.clone();
+            let page = cx.add_window(move |_, _| UniformPage {
+                created: page_created,
+            });
+            let window: AnyWindowHandle = page.into();
+            if !layers {
+                with_window(cx, window, |window, _| window.set_scroll_layers(false));
+            }
+            open_at(cx, window, 2.);
+            let mut composited = 0;
+            for step in 0..18 {
+                scroll(cx, window, ScrollDelta::Pixels(point(px(0.), px(-2.))));
+                if layers && decision(cx, window) == Some(Decision::Composite) {
+                    composited += 1;
+                }
+                render_again_and_settle(cx, step, &[window], |_, _| {});
+            }
+            assert!(
+                !layers || composited > 9,
+                "composited {composited} of 18 frames"
+            );
+            // Rows 1 to 4 show at every offset from 0 to 36 px.
+            let created = created.borrow();
+            for row in 1..=4 {
+                assert_eq!(
+                    created.get(&row),
+                    Some(&1),
+                    "layers {layers}: documents created per row {created:?}"
+                );
+            }
+        }
+    }
+
+    /// What a row of [`LeavingPage`] keeps as element state, only to be
+    /// counted.
+    struct Kept;
+
+    /// A white panel holding a list of rows 40 px tall. Row 2 takes element
+    /// state in the list's render callback and has no other.
+    struct LeavingPage {
+        state: ListState,
+        created: Created,
+    }
+
+    impl Render for LeavingPage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let created = self.created.clone();
+            div().size_full().bg(rgb(0xffffff)).child(
+                crate::list(self.state.clone(), move |row, window, cx| {
+                    if row == 2 {
+                        let created = created.clone();
+                        window.use_keyed_state("kept", cx, move |_, _| {
+                            *created.borrow_mut().entry(row).or_default() += 1;
+                            Kept
+                        });
+                    }
+                    div()
+                        .w(px(WIDTH))
+                        .h(px(40.))
+                        .bg(row_color(row))
+                        .into_any_element()
+                })
+                .w(px(WIDTH))
+                .h(px(VIEWPORT)),
+            )
+        }
+    }
+
+    /// A row whose only element state is one its render took lets go of it
+    /// when it leaves the viewport, as it does without layers, and takes it
+    /// anew when it comes back: the layer counts the row as holding element
+    /// states.
+    #[crate::test]
+    fn a_row_that_leaves_lets_go_of_the_state_its_render_took(cx: &mut TestAppContext) {
+        if !crate::fast::layers::COMPILED {
+            return;
+        }
+        for layers in [true, false] {
+            let created = Created::default();
+            let page_created = created.clone();
+            let page = cx.add_window(move |_, _| LeavingPage {
+                state: ListState::new(ROWS, ListAlignment::Top, px(160.)),
+                created: page_created,
+            });
+            let window: AnyWindowHandle = page.into();
+            if !layers {
+                with_window(cx, window, |window, _| window.set_scroll_layers(false));
+            }
+            open_at(cx, window, 2.);
+            cx.run_until_parked();
+            draw(cx, window);
+            // 210 px down takes row 2 (80 to 120 px) out of the 200 px
+            // viewport; 210 px up brings it back.
+            for dy in [-7., 7.] {
+                for _ in 0..30 {
+                    scroll(cx, window, ScrollDelta::Pixels(point(px(0.), px(dy))));
+                    cx.run_until_parked();
+                }
+            }
+            assert_eq!(
+                created.borrow().get(&2),
+                Some(&2),
+                "layers {layers}: row 2 created its state once before leaving and once after"
+            );
+        }
     }
 }

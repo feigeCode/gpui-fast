@@ -1,8 +1,8 @@
 use crate::{
-    AnyWindowHandle, AtlasKey, AtlasTile, AtlasTextureId, Bounds, DevicePixels, DisplayId,
-    DispatchEventResult, GpuSpecs, HeadlessAtlas, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestDisplay, TestPlatform,
+    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
+    DispatchEventResult, DisplayId, GpuSpecs, HeadlessAtlas, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PromptButton, RequestFrameOptions, Scene, Size, TestDisplay, TestPlatform,
     TextInputConfiguration, TextInputStateChange, TileId, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
     WindowVisibility,
@@ -731,7 +731,10 @@ mod dynamic_texture_tests {
             height: DevicePixels(3),
         };
         let mut build = || Ok(Some((texture_size, Cow::Owned(vec![0; 48]))));
-        let tile = atlas.get_or_insert_with(key.clone(), &mut build).unwrap().unwrap();
+        let tile = atlas
+            .get_or_insert_with(key.clone(), &mut build)
+            .unwrap()
+            .unwrap();
         let update_bounds = Bounds {
             origin: Point {
                 x: DevicePixels(1),
@@ -748,7 +751,10 @@ mod dynamic_texture_tests {
         atlas.0.lock().resource_generation = 3;
 
         let state = atlas.0.lock();
-        assert_eq!(tile.texture_id.kind, crate::AtlasTextureKind::DynamicTexture);
+        assert_eq!(
+            tile.texture_id.kind,
+            crate::AtlasTextureKind::DynamicTexture
+        );
         assert_eq!(state.updates.len(), 1);
         assert!(state.updates[0].key == key);
         assert_eq!(state.updates[0].bounds, update_bounds);

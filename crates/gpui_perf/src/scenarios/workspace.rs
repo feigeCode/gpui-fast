@@ -43,7 +43,7 @@ use std::{cell::Cell, ops::Range, rc::Rc};
 use gpui::{
     AnyView, App, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, FontWeight, Global, Hsla, InputEvent as _, IntoElement, MouseMoveEvent,
-    PathBuilder, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, StyleRefinement,
+    PathBuilder, Pixels, Render, ScrollDelta, ScrollEvent, SharedString, StyleRefinement,
     Subscription, TouchPhase, UTF16Selection, UniformListScrollHandle, Window, canvas, div, fill,
     hsla, point, prelude::*, px, relative, size, uniform_list,
 };
@@ -264,7 +264,7 @@ impl crate::Scenario for WorkspaceScenario {
                 // Forty notches down, forty back up.
                 let down = (frame / 40).is_multiple_of(2);
                 window.dispatch_event(
-                    ScrollWheelEvent {
+                    ScrollEvent {
                         position: point(px(300.), px(400.)),
                         delta: ScrollDelta::Pixels(point(
                             px(0.),
@@ -272,6 +272,7 @@ impl crate::Scenario for WorkspaceScenario {
                         )),
                         modifiers: Default::default(),
                         touch_phase: TouchPhase::Moved,
+                        ..Default::default()
                     }
                     .to_platform_input(),
                     cx,

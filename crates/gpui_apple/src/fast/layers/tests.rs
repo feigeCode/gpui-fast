@@ -24,6 +24,96 @@ use crate::metal_renderer::{InstanceBufferPool, MetalRenderer};
 
 const TILE: u32 = 512;
 
+#[path = "../../../../gpui/src/fast/rounded_clip_fixtures.rs"]
+mod rounded_clip_tests;
+
+#[gpui::test]
+fn rounded_overflow_retained_child_follows_ancestor_clip(cx: &mut gpui::TestAppContext) {
+    let mut harness = Harness::new().expect("retained clipping regression requires a GPU");
+    rounded_clip_tests::retained_frames(cx, |scene, size| harness.render(scene, size));
+}
+
+fn render_div_fixture(cx: &mut gpui::TestAppContext, build: fn() -> gpui::Div) -> (Vec<u8>, usize) {
+    let mut harness = Harness::new().expect("rounded clipping regression requires a Metal device");
+    rounded_clip_tests::render_with(cx, build, |scene, size| harness.render(scene, size))
+}
+
+#[gpui::test]
+fn rounded_overflow_inside_scroll_tiles_matches_direct_pixels(cx: &mut gpui::TestAppContext) {
+    let mut harness = Harness::new().expect("rounded clipping regression requires a Metal device");
+    rounded_clip_tests::render_with(cx, rounded_clip_tests::square_fixture, |scene, size| {
+        let direct = harness.render(scene, size);
+        let tiled = rounded_clip_tests::tiled_scene(scene, size);
+        let actual = harness.render(&tiled, size);
+        assert_same_pixels(&actual, &direct, size.width.0 as usize);
+        actual
+    });
+}
+
+/// Manual timing reuses a private target and waits for GPU completion without
+/// reading pixels back. Compare the
+/// same 64 descendants with and without curved overflow, at two target sizes,
+/// to expose full-viewport mask work even when the clipped elements are small.
+#[gpui::test]
+#[ignore = "manual GPU performance measurement"]
+fn rounded_overflow_mask_cost(cx: &mut gpui::TestAppContext) {
+    fn rectangular() -> gpui::Div {
+        use gpui::{ParentElement as _, Styled as _};
+        gpui::div()
+            .flex()
+            .flex_wrap()
+            .size(px(64.))
+            .bg(gpui::white())
+            .children((0..64).map(|_| {
+                gpui::div()
+                    .size(px(8.))
+                    .overflow_hidden()
+                    .child(gpui::div().size(px(8.)).bg(gpui::black()))
+            }))
+    }
+    for side in [128, 1024] {
+        for (name, build) in [
+            ("rectangle", rectangular as fn() -> gpui::Div),
+            ("rounded", rounded_clip_tests::sibling_fixture),
+        ] {
+            let mut harness = Harness::new().expect("timing requires Metal");
+            rounded_clip_tests::render_with(cx, build, |scene, _| {
+                let extent = device_size(side, side);
+                let descriptor = metal::TextureDescriptor::new();
+                descriptor.set_width(side as u64);
+                descriptor.set_height(side as u64);
+                descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+                descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+                descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+                let target = harness.renderer.device.new_texture(&descriptor);
+                harness.renderer.update_path_intermediate_textures(extent);
+                let mut samples = Vec::new();
+                for frame in 0..18 {
+                    objc2::rc::autoreleasepool(|_| {
+                        let start = std::time::Instant::now();
+                        let commands = harness
+                            .renderer
+                            .render_frame(scene, &target, extent)
+                            .unwrap();
+                        let encoded = start.elapsed();
+                        commands.commit();
+                        commands.wait_until_completed();
+                        if frame >= 3 {
+                            samples.push((start.elapsed(), encoded));
+                        }
+                    });
+                }
+                samples.sort();
+                eprintln!(
+                    "64 {name} clips, {side}px target: median {:?}, encode {:?}",
+                    samples[7].0, samples[7].1
+                );
+                Vec::new()
+            });
+        }
+    }
+}
+
 #[test]
 fn harness_renders_a_quad_at_the_right_pixels() {
     let Some(mut harness) = Harness::new() else {
@@ -863,3 +953,6 @@ impl Harness {
             .into_raw()
     }
 }
+
+#[path = "../../../../gpui_linux/src/fast/composition/occluders.rs"]
+mod x11_occluder_tests;

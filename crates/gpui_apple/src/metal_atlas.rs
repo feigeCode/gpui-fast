@@ -178,9 +178,9 @@ impl AtlasBackend for MetalAtlasTextures {
         bytes: &[u8],
     ) -> Result<AtlasTile> {
         let tile = match kind {
-            AtlasTextureKind::DynamicTexture => {
-                self.allocate_dedicated(size, kind).context("failed to allocate")?
-            }
+            AtlasTextureKind::DynamicTexture => self
+                .allocate_dedicated(size, kind)
+                .context("failed to allocate")?,
             _ => self.allocate(size, kind).context("failed to allocate")?,
         };
         let texture = self
@@ -233,7 +233,12 @@ impl AtlasBackend for MetalAtlasTextures {
         }
     }
 
-    fn update(&mut self, tile: AtlasTile, bounds: Bounds<DevicePixels>, bytes: &[u8]) -> Result<()> {
+    fn update(
+        &mut self,
+        tile: AtlasTile,
+        bounds: Bounds<DevicePixels>,
+        bytes: &[u8],
+    ) -> Result<()> {
         let bytes_per_pixel = self
             .texture(tile.texture_id)
             .context("updated tile refers to a missing texture")?
@@ -406,7 +411,9 @@ impl MetalAtlasTextures {
     fn texture(&self, id: AtlasTextureId) -> Option<&MetalAtlasTexture> {
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &self.monochrome_textures,
-            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => &self.polychrome_textures,
+            AtlasTextureKind::Polychrome | AtlasTextureKind::DynamicTexture => {
+                &self.polychrome_textures
+            }
             AtlasTextureKind::Image => &self.image_textures,
             AtlasTextureKind::ImageSmall => &self.image_small_textures,
             AtlasTextureKind::Subpixel => unreachable!(),
