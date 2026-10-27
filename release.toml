@@ -1,7 +1,7 @@
 # Metadata applied only to target/release-workspace, never upstream manifests.
 snapshot_version = "0.3.10"
-repository = "https://github.com/longbridge/gpui-fast"
-homepage = "https://github.com/longbridge/gpui-fast"
+repository = "https://github.com/feigeCode/gpui-fast"
+homepage = "https://github.com/feigeCode/gpui-fast"
 # zed-scap's Windows backend requires the five-argument capture settings API.
 windows_capture_version = "=1.4.2"
 # Upstream pins a wgpu git revision for its unreleased Vulkan surface-drop fix
@@ -11,8 +11,26 @@ windows_capture_version = "=1.4.2"
 wgpu_version = "=30.0.1"
 
 # Dependencies come before their consumers.
+# The leaf crates keep the snapshot self-contained: every internal dependency
+# resolves to a gpui-fast-* crate in this list, so consumers no longer need
+# the gpui-pre-* registry snapshots (or a fork providing them).
 crates = [
     "gpui_macros",
+    "gpui_util",
+    "gpui_shared_string",
+    "path",
+    "collections",
+    "sum_tree",
+    "refineable",
+    "refineable/derive_refineable",
+    "zlog",
+    "ztracing_macro",
+    "ztracing",
+    "bench_metrics",
+    "http_client",
+    "http_client_tls",
+    "scheduler",
+    "reqwest_client",
     "gpui",
     "gpui_apple",
     "gpui_wgpu",
