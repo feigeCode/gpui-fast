@@ -1,0 +1,21 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "gpui-pre-derive-refineable"
+version = "0.3.126"
+license = "Apache-2.0"
+edition = "2024"
+description = "derive-refineable under the gpui-pre name GPUI Kit pins; forwards to it."
+repository = "https://github.com/feigeCode/gpui-fast"
+
+[lib]
+name = "derive_refineable"
+path = "lib.rs"
+doctest = false
+
+[features]
+default = []
+
+[dependencies.gpui_fast]
+package = "derive-refineable"
+path = "../refineable/derive_refineable"
+default-features = false

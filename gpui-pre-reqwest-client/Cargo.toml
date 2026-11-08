@@ -1,0 +1,21 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "gpui-pre-reqwest-client"
+version = "0.3.126"
+license = "Apache-2.0"
+edition = "2024"
+description = "reqwest-client under the gpui-pre name GPUI Kit pins; forwards to it."
+repository = "https://github.com/feigeCode/gpui-fast"
+
+[lib]
+name = "reqwest_client"
+path = "lib.rs"
+doctest = false
+
+[features]
+default = []
+
+[dependencies.gpui_fast]
+package = "reqwest-client"
+path = "../reqwest_client"
+default-features = false
