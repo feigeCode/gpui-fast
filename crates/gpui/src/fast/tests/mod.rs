@@ -4,7 +4,6 @@ mod a11y;
 mod cached_layout;
 mod dependencies;
 mod dispatch;
-mod dynamic_textures;
 mod em_metrics;
 mod global_id;
 mod interactive_text;

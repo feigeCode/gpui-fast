@@ -212,7 +212,6 @@ impl WgpuResources {
 }
 
 pub(crate) struct WgpuRendererCore {
-    pub(crate) fast_dynamic_textures: crate::fast::dynamic_textures::TextureStore,
     pub(crate) resources: WgpuResources,
     pub(crate) atlas: Arc<WgpuAtlas>,
     pub(crate) path_globals_offset: u64,
@@ -1245,7 +1244,7 @@ impl WgpuRenderer {
 }
 
 impl WgpuRendererCore {
-    pub(crate) fn new(
+    fn new(
         context: &WgpuContext,
         atlas: Arc<WgpuAtlas>,
         target_format: wgpu::TextureFormat,
@@ -1400,9 +1399,6 @@ impl WgpuRendererCore {
             target_format,
             max_texture_size,
             fast_frame: crate::fast::frame::FrameState::default(),
-            fast_dynamic_textures: crate::fast::dynamic_textures::TextureStore::clone(
-                &context.fast_dynamic_textures,
-            ),
         }
     }
 
@@ -1450,7 +1446,7 @@ impl WgpuRendererCore {
         resources.path_msaa_view = path_msaa_view;
     }
 
-    pub(crate) fn render_frame(
+    fn render_frame(
         &mut self,
         scene: &Scene,
         target_view: &wgpu::TextureView,
