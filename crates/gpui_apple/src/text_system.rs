@@ -63,10 +63,10 @@ const kCGImageAlphaOnly: u32 = 7;
 pub struct AppleTextSystem(RwLock<AppleTextSystemState>);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct FontKey {
+pub(crate) struct FontKey {
     font_family: SharedString,
     font_features: FontFeatures,
-    font_fallbacks: Option<FontFallbacks>,
+    pub(crate) font_fallbacks: Option<FontFallbacks>,
 }
 
 struct AppleTextSystemState {
@@ -78,6 +78,7 @@ struct AppleTextSystemState {
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
     sized_fonts: crate::fast::text_system::SizedFonts,
+    color_bitmap_fonts: crate::fast::color_bitmap_fonts::ColorBitmapFonts,
 }
 
 impl AppleTextSystem {
@@ -92,6 +93,7 @@ impl AppleTextSystem {
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
             sized_fonts: crate::fast::text_system::SizedFonts::default(),
+            color_bitmap_fonts: crate::fast::color_bitmap_fonts::ColorBitmapFonts::default(),
         }))
     }
 }
@@ -280,6 +282,10 @@ impl AppleTextSystemState {
             })
             .collect::<Result<Vec<_>>>()?;
         self.memory_source.add_fonts(fonts.into_iter())?;
+        crate::fast::font_fallbacks::forget_cascades(
+            &mut self.font_selections,
+            &mut self.font_ids_by_font_key,
+        );
         Ok(())
     }
 
@@ -300,33 +306,12 @@ impl AppleTextSystemState {
         for font in family.fonts() {
             let mut font = font.load()?;
 
-            apply_features_and_fallbacks(&mut font, features, fallbacks)?;
-            // This block contains a precautionary fix to guard against loading fonts
-            // that might cause panics due to `.unwrap()`s up the chain.
-            {
-                // We use the 'm' character for text measurements in various spots
-                // (e.g., the editor). However, at time of writing some of those usages
-                // will panic if the font has no 'm' glyph.
-                //
-                // Therefore, we check up front that the font has the necessary glyph.
-                let has_m_glyph = font.glyph_for_char('m').is_some();
-
-                // HACK: The 'Segoe Fluent Icons' font does not have an 'm' glyph,
-                // but we need to be able to load it for rendering Windows icons in
-                // the Storybook (on macOS).
-                let is_segoe_fluent_icons = font.full_name() == "Segoe Fluent Icons";
-
-                if !has_m_glyph && !is_segoe_fluent_icons {
-                    // I spent far too long trying to track down why a font missing the 'm'
-                    // character wasn't loading. This log statement will hopefully save
-                    // someone else from suffering the same fate.
-                    log::warn!(
-                        "font '{}' has no 'm' character and was not loaded",
-                        font.full_name()
-                    );
-                    continue;
-                }
-            }
+            let fast_app_fallbacks = crate::fast::font_fallbacks::AppFallbacks::new(
+                &self.memory_source,
+                fallbacks,
+                &font,
+            );
+            apply_features_and_fallbacks(&mut font, features, fallbacks, &fast_app_fallbacks)?;
 
             // We've seen a number of panics in production caused by calling font.properties()
             // which unwraps a downcast to CFNumber. This is an attempt to avoid the panic,
@@ -388,6 +373,11 @@ impl AppleTextSystemState {
             self.postscript_names_by_font_id
                 .insert(font_id, postscript_name);
             self.fonts.push(font);
+            crate::fast::color_bitmap_fonts::ColorBitmapFonts::note(
+                &mut self.color_bitmap_fonts,
+                font_id,
+                &self.fonts[font_id.0],
+            );
         }
         Ok(font_ids)
     }
@@ -416,11 +406,22 @@ impl AppleTextSystemState {
                 .push(font_kit::font::Font::from_core_graphics_font(
                     requested_font.copy_to_CGFont(),
                 ));
+            crate::fast::color_bitmap_fonts::ColorBitmapFonts::note(
+                &mut self.color_bitmap_fonts,
+                font_id,
+                &self.fonts[font_id.0],
+            );
             font_id
         }
     }
 
     fn is_emoji(&self, font_id: FontId) -> bool {
+        if crate::fast::color_bitmap_fonts::ColorBitmapFonts::contains(
+            &self.color_bitmap_fonts,
+            font_id,
+        ) {
+            return true;
+        }
         self.postscript_names_by_font_id
             .get(&font_id)
             .is_some_and(|postscript_name| {

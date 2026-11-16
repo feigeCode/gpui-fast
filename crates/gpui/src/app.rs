@@ -1143,11 +1143,22 @@ impl App {
             }
         }));
 
+        let fast_power = crate::fast::misc::system_power::PowerNotifications::new(
+            platform.foreground_executor(),
+        );
         platform.on_system_sleep(Box::new({
             let app = Rc::downgrade(&app);
+            let fast_power = Rc::clone(&fast_power);
             move || {
                 if let Some(app) = app.upgrade() {
-                    let cx = &mut app.borrow_mut();
+                    let Some(cx) =
+                        &mut crate::fast::misc::system_power::PowerNotifications::borrow_for_sleep(
+                            &fast_power,
+                            &app,
+                        )
+                    else {
+                        return;
+                    };
                     cx.system_sleep_observers
                         .clone()
                         .retain(move |callback| (callback)(cx));
@@ -1159,7 +1170,14 @@ impl App {
             let app = Rc::downgrade(&app);
             move || {
                 if let Some(app) = app.upgrade() {
-                    let cx = &mut app.borrow_mut();
+                    let Some(cx) =
+                        &mut crate::fast::misc::system_power::PowerNotifications::borrow_for_wake(
+                            &fast_power,
+                            &app,
+                        )
+                    else {
+                        return;
+                    };
                     cx.system_wake_observers
                         .clone()
                         .retain(move |callback| (callback)(cx));
@@ -1473,27 +1491,12 @@ impl App {
         invalidator: WindowInvalidator,
         entities: &FxHashSet<EntityId>,
     ) {
-        let mut tracked_entities =
-            std::mem::take(self.tracked_entities.entry(window_handle.id).or_default());
-        for entity in tracked_entities.iter() {
-            self.window_invalidators_by_entity
-                .entry(*entity)
-                .and_modify(|windows| {
-                    windows.remove(&window_handle.id);
-                });
-        }
-        for entity in entities.iter() {
-            self.window_invalidators_by_entity
-                .entry(*entity)
-                .or_default()
-                .insert(window_handle.id, invalidator.clone());
-            self.current_window_by_entity
-                .insert(*entity, window_handle.id);
-        }
-        tracked_entities.clear();
-        tracked_entities.extend(entities.iter().copied());
-        self.tracked_entities
-            .insert(window_handle.id, tracked_entities);
+        crate::fast::tracked_entities::record_entities_accessed(
+            self,
+            window_handle,
+            invalidator,
+            entities,
+        );
     }
 
     pub(crate) fn new_observer(&mut self, key: EntityId, value: Handler) -> Subscription {

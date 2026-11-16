@@ -51,6 +51,7 @@ pub trait Scenario {
 pub fn all_scenarios() -> Vec<Box<dyn Scenario>> {
     let mut scenarios = Vec::new();
     scenarios.extend(scenarios::form::scenarios());
+    scenarios.extend(scenarios::focusable::scenarios());
     scenarios.extend(scenarios::list::scenarios());
     scenarios.extend(scenarios::table::scenarios());
     scenarios.extend(scenarios::settings::scenarios());
@@ -60,5 +61,6 @@ pub fn all_scenarios() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(scenarios::scroll::scenarios());
     scenarios.extend(scenarios::chat::scenarios());
     scenarios.extend(scenarios::chat_patterns::scenarios());
+    scenarios.extend(scenarios::nested_cached::scenarios());
     scenarios
 }

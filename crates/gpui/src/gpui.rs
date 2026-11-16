@@ -55,6 +55,7 @@ mod style;
 mod styled;
 mod subscription;
 mod svg_renderer;
+#[path = "fast/tab_stop.rs"]
 mod tab_stop;
 mod taffy;
 mod text_system;
@@ -127,6 +128,9 @@ pub use fast::composition::{
     ComposedScene, ComposedSceneLayer, CompositionSurfaceId, CompositionSurfaceKind,
     PlatformCompositionSurface, PlatformCompositionSurfaceContent, PlatformSurfaceAttachment,
     WindowComposition, WindowCompositionSurface,
+};
+pub use fast::dynamic_textures::{
+    DynamicTexture, DynamicTextureId, DynamicTexturePlatform, set_dynamic_texture_platform,
 };
 pub use fast::layers::scene::{
     LAYER_TILE_TEXTURE_BASE, LayerContent, LayerFrame, LayerKey, SceneLayers, TileCoord,

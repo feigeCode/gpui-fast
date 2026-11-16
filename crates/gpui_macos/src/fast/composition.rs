@@ -24,8 +24,9 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use gpui::{
-    Bounds, ComposedScene, CompositionSurfaceId, DevicePixels, PlatformCompositionSurface,
-    PlatformCompositionSurfaceContent, PlatformSurfaceAttachment, Point, Size, px,
+    Bounds, ComposedScene, ComposedSceneLayer, CompositionSurfaceId, DevicePixels,
+    PlatformCompositionSurface, PlatformCompositionSurfaceContent, PlatformSurfaceAttachment,
+    Point, Scene, Size, px,
 };
 use objc2::{
     class, msg_send,
@@ -261,6 +262,21 @@ fn send_window_event(this: &AnyObject, event: Id, superclass: &AnyClass) {
         kind,
         NSEventType::LeftMouseUp | NSEventType::RightMouseUp | NSEventType::OtherMouseUp
     );
+    // A press on the window's own chrome (the resize border, the titlebar
+    // buttons) belongs to AppKit, as in a window without composition.
+    // `root.hitTest` below cannot see the frame view, so a resize grabbed where
+    // a native view reaches the window's edge would make that view the press
+    // owner and dispatch the press to GPUI. AppKit's live-resize loop can then
+    // consume the matching mouse-up (it does with a physical mouse on macOS
+    // 26.6), which leaves the press open and loses the next click. A release
+    // that does reach `sendEvent:` still takes the path below, which clears
+    // the owner.
+    if observe && !up && unsafe { hits_window_chrome(this, root.as_ptr(), event) } {
+        unsafe {
+            let _: () = msg_send![super(this, superclass), sendEvent: event];
+        }
+        return;
+    }
     let button = if observe {
         let number: NSInteger = unsafe { msg_send![event, buttonNumber] };
         1u64.checked_shl(number as u32).unwrap_or(0)
@@ -344,6 +360,29 @@ fn send_window_event(this: &AnyObject, event: Id, superclass: &AnyClass) {
         let _: () = msg_send![super(this, superclass), sendEvent: event];
     }
     state.lock().fast_composition.native_event = previous;
+}
+
+/// Whether AppKit hit-tests `event` outside the window's view `root`: to the
+/// frame view itself (its resize border) or to one of its controls, such as
+/// the titlebar buttons.
+unsafe fn hits_window_chrome(window: &AnyObject, root: Id, event: Id) -> bool {
+    unsafe {
+        let content: Id = msg_send![window, contentView];
+        if content.is_null() {
+            return false;
+        }
+        let frame_view: Id = msg_send![content, superview];
+        if frame_view.is_null() {
+            return false;
+        }
+        let location: NSPoint = msg_send![event, locationInWindow];
+        let target: Id = msg_send![frame_view, hitTest: location];
+        if target.is_null() {
+            return false;
+        }
+        let inside: Bool = msg_send![target, isDescendantOf: root];
+        !inside.as_bool()
+    }
 }
 
 unsafe fn belongs_to_native(view: Id, native: &[usize]) -> bool {
@@ -498,23 +537,31 @@ pub(crate) fn draw_composed(window_state: &Rc<Mutex<MacWindowState>>, scene: Com
         state.renderer.draw(scene.scene());
         return;
     };
-    for layer in scene.layers() {
-        let surface_scene = match scene.layer_scene(layer) {
-            Ok(surface_scene) => surface_scene,
-            Err(error) => {
-                log::error!("replaying AppKit composition scene: {error:#}");
-                return;
+    let whole_scene = whole_scene_layer(scene.scene(), scene.layers());
+    for (layer_index, layer) in scene.layers().iter().enumerate() {
+        let replayed_scene;
+        let surface_scene = match whole_scene {
+            Some((target_index, whole_scene)) if target_index == layer_index => whole_scene,
+            _ => {
+                replayed_scene = match scene.layer_scene(layer) {
+                    Ok(surface_scene) => surface_scene,
+                    Err(error) => {
+                        log::error!("replaying AppKit composition scene: {error:#}");
+                        return;
+                    }
+                };
+                &replayed_scene
             }
         };
         if layer.surface == base_surface {
-            state.renderer.draw(&surface_scene);
+            state.renderer.draw(surface_scene);
         } else if let Some(surface) = state.fast_composition.gpui_surfaces.get_mut(&layer.surface) {
             {
                 let mut regions = surface.input_regions.borrow_mut();
                 regions.clear();
                 regions.extend(scene.layer_hitboxes(layer).iter().cloned());
             }
-            surface.renderer.draw(&surface_scene);
+            surface.renderer.draw(surface_scene);
         } else {
             log::error!(
                 "missing AppKit GPUI composition surface {:?}",
@@ -523,6 +570,32 @@ pub(crate) fn draw_composed(window_state: &Rc<Mutex<MacWindowState>>, scene: Com
         }
     }
 }
+
+/// `present` supplies the current frame's scene after `Frame::finish`.
+/// Only the layer covering its full stream may borrow it; other layers must
+/// have empty range lists and still replay and draw to clear their surfaces.
+fn whole_scene_layer<'a>(
+    scene: &'a Scene,
+    layers: &[ComposedSceneLayer],
+) -> Option<(usize, &'a Scene)> {
+    let mut target = None;
+    for (index, layer) in layers.iter().enumerate() {
+        if !layer.ranges.is_empty() {
+            let [range] = layer.ranges.as_slice() else {
+                return None;
+            };
+            if target.is_some() || range.start != 0 || range.end != scene.len() {
+                return None;
+            }
+            target = Some((index, scene));
+        }
+    }
+    target
+}
+
+#[cfg(test)]
+#[path = "composition_tests.rs"]
+mod tests;
 
 /// `PlatformWindow::enable_window_composition`: an AppKit window can always
 /// compose, and sets itself up when it's first given an order.
