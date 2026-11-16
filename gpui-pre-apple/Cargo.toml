@@ -1,0 +1,21 @@
+# Modified by Longbridge for gpui-fast publication.
+[package]
+name = "gpui-pre-apple"
+version = "0.3.126"
+license = "Apache-2.0"
+edition = "2024"
+description = "gpui-fast-apple under the gpui-pre name GPUI Kit pins; forwards to it."
+repository = "https://github.com/feigeCode/gpui-fast"
+
+[lib]
+name = "gpui_apple"
+path = "lib.rs"
+doctest = false
+
+[features]
+default = []
+
+[dependencies.gpui_fast]
+package = "gpui-fast-apple"
+path = "../gpui_apple"
+default-features = false
