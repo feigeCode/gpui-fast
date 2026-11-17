@@ -10,8 +10,10 @@ use gpui::{AtlasTextureId, LayerFrame, Scene};
 use windows::{
     Win32::Graphics::Direct3D11::{
         D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
-        D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_IMMUTABLE, ID3D11Buffer,
-        ID3D11Device, ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D,
+        D3D11_CPU_ACCESS_WRITE, D3D11_MAP_WRITE_DISCARD, D3D11_SUBRESOURCE_DATA,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DYNAMIC, D3D11_USAGE_IMMUTABLE, ID3D11Buffer,
+        ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11ShaderResourceView,
+        ID3D11Texture2D,
     },
     Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC},
     core::Interface as _,
@@ -159,24 +161,25 @@ pub(crate) fn bind(
 ) -> Result<()> {
     masks.for_device(target.device);
     if view.is_some() && masks.flags.is_none() {
-        let values = [1u32, 0, 0, 0];
         let desc = D3D11_BUFFER_DESC {
             ByteWidth: 16,
-            Usage: D3D11_USAGE_IMMUTABLE,
+            Usage: D3D11_USAGE_DYNAMIC,
             BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-            ..Default::default()
-        };
-        let data = D3D11_SUBRESOURCE_DATA {
-            pSysMem: values.as_ptr().cast(),
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
             ..Default::default()
         };
         unsafe {
             target
                 .device
-                .CreateBuffer(&desc, Some(&data), Some(&mut masks.flags))?;
+                .CreateBuffer(&desc, None, Some(&mut masks.flags))?;
         }
     }
     let flags = if view.is_some() {
+        update_clip_flags(
+            target.device_context,
+            masks.flags.as_ref().context("clip flags buffer missing")?,
+            masks.clips.len() as u32,
+        )?;
         masks.flags.clone()
     } else {
         None
@@ -188,6 +191,21 @@ pub(crate) fn bind(
         target
             .device_context
             .PSSetShaderResources(15, Some(slice::from_ref(&view.cloned())));
+    }
+    Ok(())
+}
+
+fn update_clip_flags(
+    context: &ID3D11DeviceContext,
+    buffer: &ID3D11Buffer,
+    clip_count: u32,
+) -> Result<()> {
+    let values = [1u32, clip_count, 0, 0];
+    let mut mapped = Default::default();
+    unsafe {
+        context.Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+        std::ptr::copy_nonoverlapping(values.as_ptr(), mapped.pData.cast::<u32>(), values.len());
+        context.Unmap(buffer, 0);
     }
     Ok(())
 }
@@ -269,4 +287,17 @@ pub(crate) fn draw_group(
     bind(target, &mut frame.rounded_masks, parent_mask)?;
     frame.state.forget();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rounded_clip_shader_uses_cpu_clip_count_and_fails_open() {
+        let shader = include_str!("rounded_clip_shader_build.rs");
+
+        assert!(shader.contains("uint fast_clip_count"));
+        assert!(shader.contains("index < fast_clip_count"));
+        assert!(!shader.contains("fast_clip_shapes.GetDimensions"));
+        assert!(shader.contains("if (extent.x <= 0 || extent.y <= 0) return 1.0;"));
+    }
 }

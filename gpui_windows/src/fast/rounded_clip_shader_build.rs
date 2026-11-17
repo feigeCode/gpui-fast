@@ -86,7 +86,9 @@ struct FastRoundedClip {{
 }};
 float fast_rounded_clip_coverage(float2 position, FastRoundedClip shape) {{
   float2 extent = shape.bounds.zw - shape.bounds.xy;
-  if (extent.x <= 0 || extent.y <= 0) return 0;
+  // A missing or malformed clip shape must not erase the whole layer on
+  // drivers that fail to read the auxiliary clipping texture.
+  if (extent.x <= 0 || extent.y <= 0) return 1.0;
   float2 local = position - shape.bounds.xy;
   float distance = max(max(-local.x, -local.y), max(local.x - extent.x, local.y - extent.y));
   [unroll] for (uint corner = 0; corner < 4; ++corner) {{
@@ -105,13 +107,15 @@ float fast_rounded_clip_coverage(float2 position, FastRoundedClip shape) {{
   return clamp(0.5f - distance, 0.0f, 1.0f);
 }}
 Texture2D<float4> fast_clip_shapes : register(t15);
-cbuffer FastClipParams : register(b2) {{ uint fast_clip_enabled; uint3 fast_clip_pad; }};
+cbuffer FastClipParams : register(b2) {{
+  uint fast_clip_enabled;
+  uint fast_clip_count;
+  uint2 fast_clip_pad;
+}};
 float fast_clip_coverage(float2 position) {{
-    if (fast_clip_enabled == 0) return 1.0;
-    uint width = 0, count = 0;
-    fast_clip_shapes.GetDimensions(width, count);
+    if (fast_clip_enabled == 0 || fast_clip_count == 0) return 1.0;
     float coverage = 1.0;
-    [loop] for (uint index = 0; index < count; ++index) {{
+    [loop] for (uint index = 0; index < fast_clip_count; ++index) {{
         FastRoundedClip shape;
         shape.bounds = fast_clip_shapes.Load(int3(0, index, 0));
         shape.horizontal = fast_clip_shapes.Load(int3(1, index, 0));
